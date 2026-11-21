@@ -31,6 +31,8 @@ pub struct ParsedLoadRequest {
     pub source: String,
     /// Canonical transformation specification.
     pub spec: TransformSpec,
+    /// `true` when the client supplied an explicit non-empty `f` query parameter.
+    pub explicit_format: bool,
 }
 
 /// Parses and strictly validates raw query parameters into a [`ParsedLoadRequest`].
@@ -63,9 +65,9 @@ pub fn parse_load_query(
         }
     };
 
-    let format = match raw.f.as_deref() {
-        None | Some("") => OutputFormat::default(),
-        Some(value) => value.parse::<OutputFormat>()?,
+    let (format, explicit_format) = match raw.f.as_deref() {
+        None | Some("") => (OutputFormat::default(), false),
+        Some(value) => (value.parse::<OutputFormat>()?, true),
     };
 
     let filter = match raw.filter.as_deref() {
@@ -81,6 +83,7 @@ pub fn parse_load_query(
             quality,
             filter,
         },
+        explicit_format,
     })
 }
 

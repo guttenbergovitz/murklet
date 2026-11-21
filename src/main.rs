@@ -65,6 +65,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.engine_limits = config.engine_limits();
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;
+    state.accept_negotiation = config.server.accept_negotiation;
     state.cleanup_token = config.server.cleanup_token;
     state.request_signer = request_signer;
     state.diagnostic_headers = config.server.diagnostic_headers;

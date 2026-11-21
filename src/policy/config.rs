@@ -45,6 +45,9 @@ pub struct ServerConfig {
     /// `Cache-Control` header value emitted on image responses.
     #[serde(default = "default_cache_control")]
     pub cache_control: String,
+    /// Negotiate output format from the HTTP `Accept` header when `f` is omitted (default `false`).
+    #[serde(default)]
+    pub accept_negotiation: bool,
     /// Emit extended `X-Original-*` / `X-Processed-*` headers on cache MISS (default `false`).
     #[serde(default)]
     pub diagnostic_headers: bool,
@@ -61,6 +64,7 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind_addr(),
             cache_control: default_cache_control(),
+            accept_negotiation: false,
             diagnostic_headers: false,
             cleanup_token: None,
             signing_secret: None,

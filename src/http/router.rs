@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::header::{
+    ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,6 +17,7 @@ use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag};
 use crate::domain::{DEFAULT_MAX_DIMENSION, TransformSpec};
 use crate::engine::{self, EngineLimits, TransformOutput};
 use crate::http::error::HttpError;
+use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query};
 use crate::origin::{HttpOrigin, LocalFsOrigin};
 use crate::policy::RequestSigner;
@@ -56,6 +59,8 @@ pub struct AppState {
     pub cleanup_token: Option<String>,
     /// Optional HMAC-SHA256 verifier requiring a valid `sig` parameter on `GET /load`.
     pub request_signer: Option<RequestSigner>,
+    /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
+    pub accept_negotiation: bool,
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
@@ -78,6 +83,7 @@ impl AppState {
             cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
             cleanup_token: None,
             request_signer: None,
+            accept_negotiation: false,
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
         }
@@ -129,24 +135,14 @@ async fn load_handler(
         return Err(HttpError::Unauthorized);
     }
 
-    let parsed = parse_load_query(raw_query, state.max_target_dimension)?;
-    let is_remote = is_http_source(&parsed.source);
-    let origin_id = if is_remote {
-        if state.http_origin.is_none() {
-            return Err(HttpError::Forbidden(
-                "remote HTTP(S) origins are disabled".to_owned(),
-            ));
-        }
-        HTTP_ORIGIN_ID
-    } else {
-        if state.local_origin.is_none() {
-            return Err(HttpError::Forbidden(
-                "local filesystem origin is disabled".to_owned(),
-            ));
-        }
-        LOCAL_ORIGIN_ID
-    };
+    let mut parsed = parse_load_query(raw_query, state.max_target_dimension)?;
+    let vary_accept = state.accept_negotiation && !parsed.explicit_format;
+    if vary_accept {
+        let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
+        parsed.spec.format = negotiate_format(accept);
+    }
 
+    let (origin_id, is_remote) = resolve_origin_route(&state, &parsed.source)?;
     let cache_key = CacheKey::from_parts(origin_id, &parsed.source, &parsed.spec);
     let if_none_match = headers
         .get(IF_NONE_MATCH)
@@ -168,6 +164,7 @@ async fn load_handler(
                 &cached.etag,
                 &state.cache_control,
                 "HIT",
+                vary_accept,
             ));
         }
 
@@ -177,6 +174,7 @@ async fn load_handler(
             &cached.etag,
             &state.cache_control,
             "HIT",
+            vary_accept,
             None,
         ));
     }
@@ -196,41 +194,74 @@ async fn load_handler(
         .await;
 
     let outcome = coalesced.value?;
-    let x_cache = if coalesced.was_coalesced {
-        "HIT"
-    } else {
-        "MISS"
-    };
+    Ok(build_miss_response(
+        &state,
+        &outcome,
+        parsed.spec.quality.get(),
+        if_none_match.as_deref(),
+        coalesced.was_coalesced,
+        vary_accept,
+    ))
+}
 
-    if etag_matches(if_none_match.as_deref(), &outcome.etag) {
-        return Ok(build_not_modified_response(
+fn resolve_origin_route(state: &AppState, source: &str) -> Result<(&'static str, bool), HttpError> {
+    if is_http_source(source) {
+        if state.http_origin.is_none() {
+            return Err(HttpError::Forbidden(
+                "remote HTTP(S) origins are disabled".to_owned(),
+            ));
+        }
+        Ok((HTTP_ORIGIN_ID, true))
+    } else {
+        if state.local_origin.is_none() {
+            return Err(HttpError::Forbidden(
+                "local filesystem origin is disabled".to_owned(),
+            ));
+        }
+        Ok((LOCAL_ORIGIN_ID, false))
+    }
+}
+
+fn build_miss_response(
+    state: &AppState,
+    outcome: &MissOutcome,
+    requested_quality: u8,
+    if_none_match: Option<&str>,
+    was_coalesced: bool,
+    vary_accept: bool,
+) -> Response {
+    let x_cache = if was_coalesced { "HIT" } else { "MISS" };
+
+    if etag_matches(if_none_match, &outcome.etag) {
+        return build_not_modified_response(
             &outcome.etag,
             &state.cache_control,
             x_cache,
-        ));
+            vary_accept,
+        );
     }
 
-    let diagnostics =
-        (!coalesced.was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
-            original_width: outcome.output.source_dimensions.width(),
-            original_height: outcome.output.source_dimensions.height(),
-            processed_width: outcome.output.output_dimensions.width(),
-            processed_height: outcome.output.output_dimensions.height(),
-            original_size: outcome.original_size,
-            processed_size: outcome.output.bytes.len(),
-            format: outcome.output.format.as_str(),
-            quality: parsed.spec.quality.get(),
-            filter: outcome.output.filter.to_string(),
-        });
+    let diagnostics = (!was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
+        original_width: outcome.output.source_dimensions.width(),
+        original_height: outcome.output.source_dimensions.height(),
+        processed_width: outcome.output.output_dimensions.width(),
+        processed_height: outcome.output.output_dimensions.height(),
+        original_size: outcome.original_size,
+        processed_size: outcome.output.bytes.len(),
+        format: outcome.output.format.as_str(),
+        quality: requested_quality,
+        filter: outcome.output.filter.to_string(),
+    });
 
-    Ok(build_image_response(
+    build_image_response(
         outcome.output.bytes.clone(),
         outcome.output.format.mime_type(),
         &outcome.etag,
         &state.cache_control,
         x_cache,
+        vary_accept,
         diagnostics.as_ref(),
-    ))
+    )
 }
 
 async fn fetch_transform_and_cache(
@@ -346,12 +377,20 @@ struct DiagnosticMeta {
     filter: String,
 }
 
-fn build_not_modified_response(etag: &str, cache_control: &str, x_cache: &'static str) -> Response {
+fn build_not_modified_response(
+    etag: &str,
+    cache_control: &str,
+    x_cache: &'static str,
+    vary_accept: bool,
+) -> Response {
     let mut response = StatusCode::NOT_MODIFIED.into_response();
     let headers = response.headers_mut();
     insert_header(headers, ETAG, etag);
     insert_header(headers, CACHE_CONTROL, cache_control);
     insert_header(headers, HeaderName::from_static("x-cache"), x_cache);
+    if vary_accept {
+        insert_header(headers, VARY, "Accept");
+    }
     response
 }
 
@@ -361,6 +400,7 @@ fn build_image_response(
     etag: &str,
     cache_control: &str,
     x_cache: &'static str,
+    vary_accept: bool,
     diagnostics: Option<&DiagnosticMeta>,
 ) -> Response {
     let content_length = bytes.len().to_string();
@@ -372,6 +412,9 @@ fn build_image_response(
     insert_header(headers, ETAG, etag);
     insert_header(headers, CACHE_CONTROL, cache_control);
     insert_header(headers, HeaderName::from_static("x-cache"), x_cache);
+    if vary_accept {
+        insert_header(headers, VARY, "Accept");
+    }
 
     if let Some(meta) = diagnostics {
         insert_header(
@@ -821,5 +864,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(valid_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn load_negotiates_format_via_accept_header_with_vary_and_separate_cache_keys() {
+        let fixture = TestFixture::new("negotiate");
+        let mut state = fixture.state();
+        state.accept_negotiation = true;
+        let app = build_router(Arc::new(state));
+
+        // Omitted `f` with browser Accept header negotiates WebP and sets Vary: Accept.
+        let webp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40")
+                    .header(ACCEPT, "image/avif,image/webp,*/*;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webp.status(), StatusCode::OK);
+        assert_eq!(webp.headers().get(CONTENT_TYPE).unwrap(), "image/webp");
+        assert_eq!(webp.headers().get(VARY).unwrap(), "Accept");
+        assert_eq!(webp.headers().get("x-cache").unwrap(), "MISS");
+
+        // Same URL with Accept: image/jpeg gets a distinct JPEG variant (no cache poisoning).
+        let jpeg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40")
+                    .header(ACCEPT, "image/jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jpeg.status(), StatusCode::OK);
+        assert_eq!(jpeg.headers().get(CONTENT_TYPE).unwrap(), "image/jpeg");
+        assert_eq!(jpeg.headers().get(VARY).unwrap(), "Accept");
+        assert_eq!(jpeg.headers().get("x-cache").unwrap(), "MISS");
+
+        // Explicit `f=png` bypasses Accept negotiation and omits Vary: Accept.
+        let explicit_png = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=png")
+                    .header(ACCEPT, "image/webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit_png.status(), StatusCode::OK);
+        assert_eq!(
+            explicit_png.headers().get(CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        assert!(explicit_png.headers().get(VARY).is_none());
     }
 }
