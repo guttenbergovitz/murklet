@@ -17,6 +17,7 @@ use crate::origin::{
     DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig, S3Credentials, S3OriginConfig,
 };
 use crate::policy::error::PolicyError;
+use crate::policy::origin_policy::{OriginPolicies, OriginPolicy, OriginPolicyConfig};
 use crate::policy::presets::{PresetConfig, PresetRegistry};
 use crate::policy::signing::RequestSigner;
 
@@ -264,6 +265,9 @@ pub struct LocalOriginConfig {
     /// Root directory containing source assets.
     #[serde(default = "default_local_root")]
     pub root: PathBuf,
+    /// Optional per-origin transformation and delivery policy (`[origins.local.policy]`).
+    #[serde(default)]
+    pub policy: OriginPolicyConfig,
 }
 
 impl Default for LocalOriginConfig {
@@ -271,6 +275,7 @@ impl Default for LocalOriginConfig {
         Self {
             enabled: true,
             root: default_local_root(),
+            policy: OriginPolicyConfig::default(),
         }
     }
 }
@@ -294,6 +299,9 @@ pub struct HttpOriginSection {
     /// Maximum number of HTTP redirects followed per fetch (default `5`).
     #[serde(default = "default_max_redirects")]
     pub max_redirects: u8,
+    /// Optional per-origin transformation and delivery policy (`[origins.http.policy]`).
+    #[serde(default)]
+    pub policy: OriginPolicyConfig,
 }
 
 impl Default for HttpOriginSection {
@@ -304,6 +312,7 @@ impl Default for HttpOriginSection {
             timeout_secs: default_http_timeout_secs(),
             connect_timeout_secs: default_http_connect_timeout_secs(),
             max_redirects: default_max_redirects(),
+            policy: OriginPolicyConfig::default(),
         }
     }
 }
@@ -342,6 +351,9 @@ pub struct S3OriginSection {
     /// Upstream TCP/TLS connect timeout in seconds (default `5`).
     #[serde(default = "default_http_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Optional per-origin transformation and delivery policy (`[origins.s3.policy]`).
+    #[serde(default)]
+    pub policy: OriginPolicyConfig,
 }
 
 impl Default for S3OriginSection {
@@ -357,6 +369,7 @@ impl Default for S3OriginSection {
             secret_access_key: None,
             timeout_secs: default_http_timeout_secs(),
             connect_timeout_secs: default_http_connect_timeout_secs(),
+            policy: OriginPolicyConfig::default(),
         }
     }
 }
@@ -436,6 +449,39 @@ impl MurkletConfig {
     /// Returns [`PolicyError::Validation`] if any preset is invalid.
     pub fn preset_registry(&self) -> Result<PresetRegistry, PolicyError> {
         PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)
+    }
+
+    /// Builds validated per-origin policies (`[origins.<kind>.policy]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::Validation`] if any per-origin policy constraint is invalid.
+    pub fn origin_policies(&self) -> Result<OriginPolicies, PolicyError> {
+        let presets = self.preset_registry()?;
+        let max_dim = self.limits.max_target_dimension;
+        Ok(OriginPolicies {
+            local: OriginPolicy::from_config(
+                "local",
+                &self.origins.local.policy,
+                max_dim,
+                &presets,
+                &self.watermarks,
+            )?,
+            http: OriginPolicy::from_config(
+                "http",
+                &self.origins.http.policy,
+                max_dim,
+                &presets,
+                &self.watermarks,
+            )?,
+            s3: OriginPolicy::from_config(
+                "s3",
+                &self.origins.s3.policy,
+                max_dim,
+                &presets,
+                &self.watermarks,
+            )?,
+        })
     }
 
     /// Builds an [`S3OriginConfig`] when `[origins.s3]` is enabled, resolving credentials
@@ -634,7 +680,7 @@ impl MurkletConfig {
         }
 
         // Validate all declared named presets eagerly at startup.
-        let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
+        let presets = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
         for (preset_name, preset_cfg) in &self.presets {
             if let Some(wm_name) = preset_cfg.watermark.as_deref()
                 && !self.watermarks.contains_key(wm_name)
@@ -644,6 +690,30 @@ impl MurkletConfig {
                 )));
             }
         }
+
+        // Validate per-origin policies eagerly at startup.
+        let max_dim = self.limits.max_target_dimension;
+        let _ = OriginPolicy::from_config(
+            "local",
+            &self.origins.local.policy,
+            max_dim,
+            &presets,
+            &self.watermarks,
+        )?;
+        let _ = OriginPolicy::from_config(
+            "http",
+            &self.origins.http.policy,
+            max_dim,
+            &presets,
+            &self.watermarks,
+        )?;
+        let _ = OriginPolicy::from_config(
+            "s3",
+            &self.origins.s3.policy,
+            max_dim,
+            &presets,
+            &self.watermarks,
+        )?;
 
         Ok(())
     }
@@ -954,6 +1024,79 @@ watermark = "missing"
 "#;
         assert!(matches!(
             MurkletConfig::from_toml_str(bad_name),
+            Err(PolicyError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn validates_per_origin_policies_and_rejects_inconsistent_references() {
+        let valid = r#"
+[watermarks]
+brand = "./assets/logo.png"
+
+[presets.avatar]
+width = 256
+format = "webp"
+
+[origins.local.policy]
+presets_only = true
+allowed_presets = ["avatar"]
+allowed_formats = ["webp", "avif"]
+max_target_dimension = 1024
+default_watermark = "brand"
+cache_control = "public, max-age=3600"
+"#;
+        let cfg = MurkletConfig::from_toml_str(valid).unwrap();
+        let policies = cfg.origin_policies().unwrap();
+        assert!(policies.local.presets_only);
+        assert!(policies.local.is_preset_allowed("avatar"));
+        assert!(!policies.local.is_preset_allowed("other"));
+        assert!(
+            policies
+                .local
+                .is_format_allowed(crate::domain::OutputFormat::Webp)
+        );
+        assert!(
+            !policies
+                .local
+                .is_format_allowed(crate::domain::OutputFormat::Jpeg)
+        );
+        assert_eq!(policies.local.effective_max_dimension(8192), 1024);
+        assert_eq!(
+            policies.local.effective_cache_control("fallback"),
+            "public, max-age=3600"
+        );
+
+        // presets_only without any declared presets fails at startup.
+        let no_presets = "
+[origins.local.policy]
+presets_only = true
+";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(no_presets),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Per-origin max_target_dimension exceeding global limit fails at startup.
+        let too_large = "
+[limits]
+max_target_dimension = 1024
+
+[origins.local.policy]
+max_target_dimension = 2048
+";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(too_large),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Unknown default_watermark fails at startup.
+        let bad_wm = r#"
+[origins.local.policy]
+default_watermark = "missing"
+"#;
+        assert!(matches!(
+            MurkletConfig::from_toml_str(bad_wm),
             Err(PolicyError::Validation(_))
         ));
     }

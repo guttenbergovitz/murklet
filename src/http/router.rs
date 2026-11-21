@@ -25,13 +25,13 @@ use crate::http::error::HttpError;
 use crate::http::metrics::{
     CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
 };
-use crate::http::negotiate::negotiate_format;
+use crate::http::negotiate::negotiate_format_allowed;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
 use crate::policy::{
-    DEFAULT_MAX_CONCURRENT_TRANSFORMS, DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, PresetRegistry,
-    RequestSigner,
+    DEFAULT_MAX_CONCURRENT_TRANSFORMS, DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, OriginPolicies,
+    OriginPolicy, PresetRegistry, RequestSigner,
 };
 
 const LOCAL_ORIGIN_ID: &str = "local";
@@ -84,6 +84,8 @@ pub struct AppState {
     pub presets: PresetRegistry,
     /// Pre-decoded policy-controlled watermarks (`[watermarks]`).
     pub watermarks: WatermarkRegistry,
+    /// Validated per-origin transformation and delivery policies (`[origins.<kind>.policy]`).
+    pub origin_policies: OriginPolicies,
     /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
     pub accept_negotiation: bool,
     /// When `true`, exposes Prometheus metrics at `GET /metrics`.
@@ -118,6 +120,7 @@ impl AppState {
             request_signer: None,
             presets: PresetRegistry::empty(),
             watermarks: WatermarkRegistry::empty(),
+            origin_policies: OriginPolicies::default(),
             accept_negotiation: false,
             metrics_enabled: true,
             diagnostic_headers: false,
@@ -146,6 +149,13 @@ impl AppState {
     #[must_use]
     pub fn with_watermarks(mut self, watermarks: WatermarkRegistry) -> Self {
         self.watermarks = watermarks;
+        self
+    }
+
+    /// Attaches validated per-origin policies (`[origins.<kind>.policy]`).
+    #[must_use]
+    pub fn with_origin_policies(mut self, origin_policies: OriginPolicies) -> Self {
+        self.origin_policies = origin_policies;
         self
     }
 
@@ -229,6 +239,67 @@ async fn load_handler(
     }
 }
 
+struct ResolvedLoad {
+    origin_id: &'static str,
+    origin_kind: OriginKind,
+    source: String,
+    spec: TransformSpec,
+    vary_accept: bool,
+    cache_control: String,
+}
+
+fn resolve_and_validate_load(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw_query: RawLoadQuery,
+) -> Result<ResolvedLoad, HttpError> {
+    let source_preview = raw_query
+        .url
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
+    let (origin_id, origin_kind) = resolve_origin_route(state, source_preview)?;
+    let origin_policy = state.origin_policies.for_origin_id(origin_id);
+
+    enforce_origin_query_policy(&raw_query, origin_policy)?;
+
+    let effective_max_dim = origin_policy.effective_max_dimension(state.max_target_dimension);
+    let mut parsed = parse_load_query_with_presets(raw_query, effective_max_dim, &state.presets)?;
+    let vary_accept = state.accept_negotiation && !parsed.explicit_format;
+    if vary_accept {
+        let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
+        parsed.spec.format = negotiate_format_allowed(accept, &origin_policy.allowed_formats);
+    }
+    if !origin_policy.is_format_allowed(parsed.spec.format) {
+        return Err(HttpError::Forbidden(format!(
+            "output format '{}' is not permitted for origin '{origin_id}'",
+            parsed.spec.format
+        )));
+    }
+    if parsed.spec.watermark.is_none() {
+        parsed.spec.watermark = origin_policy.default_watermark_spec();
+    }
+    if let Some(ref wm) = parsed.spec.watermark
+        && !state.watermarks.contains(&wm.name)
+    {
+        return Err(HttpError::BadRequest(format!(
+            "unknown watermark '{}'",
+            wm.name
+        )));
+    }
+
+    Ok(ResolvedLoad {
+        origin_id,
+        origin_kind,
+        source: parsed.source,
+        spec: parsed.spec,
+        vary_accept,
+        cache_control: origin_policy
+            .effective_cache_control(&state.cache_control)
+            .to_owned(),
+    })
+}
+
 async fn handle_load_inner(
     state: &Arc<AppState>,
     uri: &Uri,
@@ -242,24 +313,8 @@ async fn handle_load_inner(
         return Err(HttpError::Unauthorized);
     }
 
-    let mut parsed =
-        parse_load_query_with_presets(raw_query, state.max_target_dimension, &state.presets)?;
-    if let Some(ref wm) = parsed.spec.watermark
-        && !state.watermarks.contains(&wm.name)
-    {
-        return Err(HttpError::BadRequest(format!(
-            "unknown watermark '{}'",
-            wm.name
-        )));
-    }
-    let vary_accept = state.accept_negotiation && !parsed.explicit_format;
-    if vary_accept {
-        let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
-        parsed.spec.format = negotiate_format(accept);
-    }
-
-    let (origin_id, origin_kind) = resolve_origin_route(state, &parsed.source)?;
-    let cache_key = CacheKey::from_parts(origin_id, &parsed.source, &parsed.spec);
+    let resolved = resolve_and_validate_load(state, headers, raw_query)?;
+    let cache_key = CacheKey::from_parts(resolved.origin_id, &resolved.source, &resolved.spec);
     let if_none_match = headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -276,21 +331,26 @@ async fn handle_load_inner(
 
     if let Ok(Some(cached)) = cache_lookup {
         let response = if etag_matches(if_none_match.as_deref(), &cached.etag) {
-            build_not_modified_response(&cached.etag, &state.cache_control, "HIT", vary_accept)
+            build_not_modified_response(
+                &cached.etag,
+                &resolved.cache_control,
+                "HIT",
+                resolved.vary_accept,
+            )
         } else {
             build_image_response(
                 Bytes::from(cached.bytes),
                 cached.format.mime_type(),
                 &cached.etag,
-                &state.cache_control,
+                &resolved.cache_control,
                 "HIT",
-                vary_accept,
+                resolved.vary_accept,
                 None,
             )
         };
         record_load_success(
             state,
-            origin_kind,
+            resolved.origin_kind,
             cached.format,
             CacheOutcome::Hit,
             response.status().as_u16(),
@@ -300,16 +360,24 @@ async fn handle_load_inner(
     }
 
     // Cache miss: coalesce concurrent requests for the same canonical variant key.
-    let requested_quality = parsed.spec.quality.get();
+    let requested_quality = resolved.spec.quality.get();
     let coalesced = state
         .coalescer
         .execute(cache_key.clone(), || {
             let state = Arc::clone(state);
-            let source = parsed.source.clone();
-            let spec = parsed.spec.clone();
+            let source = resolved.source.clone();
+            let spec = resolved.spec.clone();
             let key = cache_key.clone();
             async move {
-                fetch_transform_and_cache(state, origin_id, origin_kind, source, spec, key).await
+                fetch_transform_and_cache(
+                    state,
+                    resolved.origin_id,
+                    resolved.origin_kind,
+                    source,
+                    spec,
+                    key,
+                )
+                .await
             }
         })
         .await;
@@ -319,9 +387,10 @@ async fn handle_load_inner(
         state,
         &outcome,
         requested_quality,
+        &resolved.cache_control,
         if_none_match.as_deref(),
         coalesced.was_coalesced,
-        vary_accept,
+        resolved.vary_accept,
     );
     let cache_outcome = if coalesced.was_coalesced {
         CacheOutcome::Coalesced
@@ -330,7 +399,7 @@ async fn handle_load_inner(
     };
     record_load_success(
         state,
-        origin_kind,
+        resolved.origin_kind,
         outcome.format,
         cache_outcome,
         response.status().as_u16(),
@@ -386,10 +455,42 @@ fn resolve_origin_route(
     }
 }
 
+fn enforce_origin_query_policy(
+    raw_query: &RawLoadQuery,
+    policy: &OriginPolicy,
+) -> Result<(), HttpError> {
+    let preset_name = raw_query.preset.as_deref().filter(|v| !v.is_empty());
+
+    if policy.presets_only {
+        if preset_name.is_none() {
+            return Err(HttpError::Forbidden(
+                "origin policy requires a named 'preset' parameter (presets_only)".to_owned(),
+            ));
+        }
+        if raw_query.has_transform_overrides() {
+            return Err(HttpError::Forbidden(
+                "ad-hoc transformation parameters are forbidden by origin policy (presets_only)"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if let Some(name) = preset_name
+        && !policy.is_preset_allowed(name)
+    {
+        return Err(HttpError::Forbidden(format!(
+            "preset '{name}' is not permitted for this origin"
+        )));
+    }
+
+    Ok(())
+}
+
 fn build_miss_response(
     state: &AppState,
     outcome: &MissOutcome,
     requested_quality: u8,
+    cache_control: &str,
     if_none_match: Option<&str>,
     was_coalesced: bool,
     vary_accept: bool,
@@ -397,12 +498,7 @@ fn build_miss_response(
     let x_cache = if was_coalesced { "HIT" } else { "MISS" };
 
     if etag_matches(if_none_match, &outcome.etag) {
-        return build_not_modified_response(
-            &outcome.etag,
-            &state.cache_control,
-            x_cache,
-            vary_accept,
-        );
+        return build_not_modified_response(&outcome.etag, cache_control, x_cache, vary_accept);
     }
 
     let diagnostics = (!was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
@@ -421,7 +517,7 @@ fn build_miss_response(
         outcome.bytes.clone(),
         outcome.format.mime_type(),
         &outcome.etag,
-        &state.cache_control,
+        cache_control,
         x_cache,
         vary_accept,
         diagnostics.as_ref(),
@@ -1401,5 +1497,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn load_enforces_per_origin_presets_only_format_and_cache_control_policy() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::policy::PresetConfig;
+
+        let fixture = TestFixture::new("origin-policy");
+        let mut raw_presets = BTreeMap::new();
+        raw_presets.insert(
+            "thumb".to_owned(),
+            PresetConfig {
+                width: Some(40),
+                format: Some("webp".to_owned()),
+                ..PresetConfig::default()
+            },
+        );
+        let presets = PresetRegistry::from_config(&raw_presets, DEFAULT_MAX_DIMENSION).unwrap();
+
+        let policies = OriginPolicies {
+            local: OriginPolicy {
+                presets_only: true,
+                allowed_presets: BTreeSet::from(["thumb".to_owned()]),
+                allowed_formats: vec![OutputFormat::Webp],
+                max_target_dimension: Some(100),
+                default_watermark: None,
+                cache_control: Some("public, max-age=120".to_owned()),
+            },
+            ..OriginPolicies::default()
+        };
+
+        let mut state = fixture.state().with_origin_policies(policies);
+        state.presets = presets;
+        let app = build_router(Arc::new(state));
+
+        // Allowed preset succeeds and emits per-origin Cache-Control.
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&preset=thumb")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get(CACHE_CONTROL).unwrap(),
+            "public, max-age=120"
+        );
+
+        // Missing preset under presets_only returns 403 Forbidden.
+        let no_preset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_preset.status(), StatusCode::FORBIDDEN);
+
+        // Ad-hoc override on top of preset under presets_only returns 403 Forbidden.
+        let override_attempt = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&preset=thumb&q=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(override_attempt.status(), StatusCode::FORBIDDEN);
     }
 }

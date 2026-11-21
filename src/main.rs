@@ -156,11 +156,13 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let request_signer = config.request_signer()?;
     let presets = config.preset_registry()?;
+    let origin_policies = config.origin_policies()?;
     let engine_limits = config.engine_limits();
     let watermarks = WatermarkRegistry::load_from_paths(&config.watermarks, &engine_limits)?;
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
-        .with_max_concurrent_transforms(config.limits.max_concurrent_transforms);
+        .with_max_concurrent_transforms(config.limits.max_concurrent_transforms)
+        .with_origin_policies(origin_policies);
     if let Some(s3) = s3_origin {
         state = state.with_s3_origin(s3);
     }

@@ -47,6 +47,15 @@ animation_policy = "first_frame"
 enabled = true
 root = "./assets"
 
+# Optional per-origin policy (`[origins.local.policy]`, `[origins.http.policy]`, `[origins.s3.policy]`):
+# [origins.local.policy]
+# presets_only = false
+# allowed_presets = ["thumb"]
+# allowed_formats = ["webp", "avif", "jpeg"]
+# max_target_dimension = 2048
+# default_watermark = "brand"
+# cache_control = "public, max-age=86400"
+
 [origins.http]
 # Remote fetching is disabled by default; enabling it requires a non-empty allowlist.
 enabled = false

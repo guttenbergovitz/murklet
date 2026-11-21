@@ -10,8 +10,24 @@ use crate::domain::OutputFormat;
 /// Falls back to [`OutputFormat::Jpeg`] when no explicit match is found or the header is absent.
 #[must_use]
 pub fn negotiate_format(accept_header: Option<&str>) -> OutputFormat {
+    negotiate_format_allowed(accept_header, &[])
+}
+
+/// Selects the best supported [`OutputFormat`] from an HTTP `Accept` header,
+/// constrained to `allowed` when non-empty.
+#[must_use]
+pub fn negotiate_format_allowed(
+    accept_header: Option<&str>,
+    allowed: &[OutputFormat],
+) -> OutputFormat {
+    let fallback = if allowed.is_empty() || allowed.contains(&OutputFormat::Jpeg) {
+        OutputFormat::Jpeg
+    } else {
+        allowed[0]
+    };
+
     let Some(raw) = accept_header else {
-        return OutputFormat::Jpeg;
+        return fallback;
     };
 
     let mut avif_q: Option<u16> = None;
@@ -51,10 +67,13 @@ pub fn negotiate_format(accept_header: Option<&str>) -> OutputFormat {
         (OutputFormat::Png, png_q.unwrap_or(0)),
     ];
 
-    let mut best_format = OutputFormat::Jpeg;
+    let mut best_format = fallback;
     let mut best_q: u16 = 0;
 
     for (format, q) in candidates {
+        if !allowed.is_empty() && !allowed.contains(&format) {
+            continue;
+        }
         if q > best_q {
             best_q = q;
             best_format = format;
@@ -140,6 +159,20 @@ mod tests {
         assert_eq!(
             negotiate_format(Some("image/webp;q=invalid, image/png")),
             OutputFormat::Png
+        );
+    }
+
+    #[test]
+    fn constrains_negotiation_to_allowed_formats() {
+        let chrome = "image/avif,image/webp,image/jpeg";
+        assert_eq!(
+            negotiate_format_allowed(Some(chrome), &[OutputFormat::Webp, OutputFormat::Jpeg]),
+            OutputFormat::Webp
+        );
+        // Falls back to first allowed format when client sends no matching header.
+        assert_eq!(
+            negotiate_format_allowed(None, &[OutputFormat::Webp, OutputFormat::Avif]),
+            OutputFormat::Webp
         );
     }
 }
