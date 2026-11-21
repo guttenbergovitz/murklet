@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::domain::DEFAULT_MAX_DIMENSION;
+use crate::domain::{DEFAULT_MAX_DIMENSION, is_valid_watermark_name};
 use crate::engine::{
     AnimationPolicy, DEFAULT_MAX_DECODED_PIXELS, DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_SOURCE_DIMENSION, EngineLimits,
@@ -25,6 +25,9 @@ pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 /// Default upper bound on concurrent CPU-bound image transformations.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFORMS: usize = 8;
+
+/// Default maximum time a request waits for a transform slot before returning `503`.
+pub const DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS: u64 = 10;
 
 /// Top-level validated Murklet service and policy configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -45,6 +48,9 @@ pub struct MurkletConfig {
     /// Optional named transformation presets (`[presets.<name>]`).
     #[serde(default)]
     pub presets: BTreeMap<String, PresetConfig>,
+    /// Optional named watermarks (`[watermarks]`) mapping logical names to local image file paths.
+    #[serde(default)]
+    pub watermarks: BTreeMap<String, PathBuf>,
 }
 
 /// Structured log output format (`server.log_format`).
@@ -125,6 +131,9 @@ pub struct CacheConfig {
     /// Interval in seconds between background eviction sweeps when `max_total_bytes` or `ttl_secs` is set.
     #[serde(default = "default_cache_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
+    /// Optional raw-source cache for remote HTTP(S) and S3 origins (`[cache.source]`).
+    #[serde(default)]
+    pub source: SourceCacheConfig,
 }
 
 impl Default for CacheConfig {
@@ -135,6 +144,36 @@ impl Default for CacheConfig {
             max_total_bytes: None,
             ttl_secs: None,
             sweep_interval_secs: DEFAULT_CACHE_SWEEP_INTERVAL_SECS,
+            source: SourceCacheConfig::default(),
+        }
+    }
+}
+
+/// Optional raw-source cache settings for remote origins (`[cache.source]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceCacheConfig {
+    /// Whether caching raw upstream bytes on disk is enabled (default `false`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory where sharded raw source blobs are stored.
+    #[serde(default = "default_source_cache_dir")]
+    pub dir: PathBuf,
+    /// Optional total disk budget in bytes for cached source blobs.
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+    /// Optional time-to-live in seconds for cached source blobs.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+impl Default for SourceCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_source_cache_dir(),
+            max_total_bytes: None,
+            ttl_secs: None,
         }
     }
 }
@@ -158,6 +197,9 @@ pub struct LimitsConfig {
     /// Maximum number of concurrent CPU-bound image transformations (backpressure guard).
     #[serde(default = "default_max_concurrent_transforms")]
     pub max_concurrent_transforms: usize,
+    /// Maximum seconds a request waits for a transform slot before returning `503 Retry-After`.
+    #[serde(default = "default_transform_queue_timeout_secs")]
+    pub transform_queue_timeout_secs: u64,
     /// Fallback policy for animated GIF/WebP inputs.
     #[serde(default)]
     pub animation_policy: AnimationPolicyConfig,
@@ -171,6 +213,7 @@ impl Default for LimitsConfig {
             max_target_dimension: default_max_target_dimension(),
             max_decoded_pixels: default_max_decoded_pixels(),
             max_concurrent_transforms: default_max_concurrent_transforms(),
+            transform_queue_timeout_secs: DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS,
             animation_policy: AnimationPolicyConfig::FirstFrame,
         }
     }
@@ -513,6 +556,31 @@ impl MurkletConfig {
                 "cache.sweep_interval_secs must be greater than zero".to_owned(),
             ));
         }
+        if self.cache.source.enabled {
+            if self.cache.source.dir.as_os_str().is_empty() {
+                return Err(PolicyError::Validation(
+                    "cache.source.dir must not be empty when cache.source is enabled".to_owned(),
+                ));
+            }
+            if self.cache.source.dir == self.cache.dir {
+                return Err(PolicyError::Validation(
+                    "cache.source.dir must differ from cache.dir".to_owned(),
+                ));
+            }
+            if let Some(max_total) = self.cache.source.max_total_bytes
+                && max_total < u64::try_from(self.limits.max_input_bytes).unwrap_or(u64::MAX)
+            {
+                return Err(PolicyError::Validation(
+                    "cache.source.max_total_bytes must be at least limits.max_input_bytes"
+                        .to_owned(),
+                ));
+            }
+            if self.cache.source.ttl_secs == Some(0) {
+                return Err(PolicyError::Validation(
+                    "cache.source.ttl_secs must be greater than zero when set".to_owned(),
+                ));
+            }
+        }
 
         if self.limits.max_input_bytes == 0 {
             return Err(PolicyError::Validation(
@@ -539,11 +607,43 @@ impl MurkletConfig {
                 "limits.max_concurrent_transforms must be greater than zero".to_owned(),
             ));
         }
+        if self.limits.transform_queue_timeout_secs == 0 {
+            return Err(PolicyError::Validation(
+                "limits.transform_queue_timeout_secs must be greater than zero".to_owned(),
+            ));
+        }
 
         self.validate_origins()?;
+        self.validate_watermarks_and_presets()?;
+
+        Ok(())
+    }
+
+    fn validate_watermarks_and_presets(&self) -> Result<(), PolicyError> {
+        for (name, path) in &self.watermarks {
+            if !is_valid_watermark_name(name) {
+                return Err(PolicyError::Validation(format!(
+                    "watermark name '{name}' must be non-empty ASCII letters, digits, '-' or '_'"
+                )));
+            }
+            if path.as_os_str().is_empty() {
+                return Err(PolicyError::Validation(format!(
+                    "watermark '{name}' path must not be empty"
+                )));
+            }
+        }
 
         // Validate all declared named presets eagerly at startup.
         let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
+        for (preset_name, preset_cfg) in &self.presets {
+            if let Some(wm_name) = preset_cfg.watermark.as_deref()
+                && !self.watermarks.contains_key(wm_name)
+            {
+                return Err(PolicyError::Validation(format!(
+                    "preset '{preset_name}' references undeclared watermark '{wm_name}'"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -620,6 +720,10 @@ fn default_cache_dir() -> PathBuf {
     PathBuf::from("./cache")
 }
 
+fn default_source_cache_dir() -> PathBuf {
+    PathBuf::from("./cache/sources")
+}
+
 const fn default_cache_sweep_interval_secs() -> u64 {
     DEFAULT_CACHE_SWEEP_INTERVAL_SECS
 }
@@ -642,6 +746,10 @@ const fn default_max_decoded_pixels() -> u64 {
 
 const fn default_max_concurrent_transforms() -> usize {
     DEFAULT_MAX_CONCURRENT_TRANSFORMS
+}
+
+const fn default_transform_queue_timeout_secs() -> u64 {
+    DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS
 }
 
 const fn default_true() -> bool {
@@ -811,5 +919,42 @@ max_redirects = 3
         assert_eq!(http_cfg.timeout, Duration::from_secs(20));
         assert_eq!(http_cfg.connect_timeout, Duration::from_secs(4));
         assert_eq!(http_cfg.max_redirects, 3);
+    }
+
+    #[test]
+    fn validates_watermarks_and_preset_watermark_references() {
+        let valid = r#"
+[watermarks]
+brand = "./assets/logo.png"
+
+[presets.branded]
+width = 800
+watermark = "brand"
+wm_pos = "south-east"
+wm_opacity = 40
+wm_scale = 20
+"#;
+        let cfg = MurkletConfig::from_toml_str(valid).unwrap();
+        assert_eq!(cfg.watermarks.len(), 1);
+
+        // Preset referencing an undeclared watermark fails validation at startup.
+        let dangling = r#"
+[presets.branded]
+watermark = "missing"
+"#;
+        assert!(matches!(
+            MurkletConfig::from_toml_str(dangling),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Illegal watermark name fails validation.
+        let bad_name = r#"
+[watermarks]
+"../evil" = "./assets/logo.png"
+"#;
+        assert!(matches!(
+            MurkletConfig::from_toml_str(bad_name),
+            Err(PolicyError::Validation(_))
+        ));
     }
 }

@@ -84,6 +84,20 @@ pub enum DomainError {
     InvalidSepia(String),
     /// Requested monochrome tint colour is not valid 3- or 6-character RGB hex.
     InvalidTint(String),
+    /// Requested duotone colour pair is not `<dark_hex>:<light_hex>`.
+    InvalidDuotone(String),
+    /// Requested posterize level count is outside `2..=16`.
+    InvalidPosterize(u8),
+    /// Requested pixelate block size is outside `2..=64`.
+    InvalidPixelate(u8),
+    /// Requested vignette strength is outside `0..=100`.
+    InvalidVignette(u8),
+    /// Requested watermark name is empty or contains illegal characters.
+    InvalidWatermarkName(String),
+    /// Requested watermark opacity is outside `1..=100`.
+    InvalidWatermarkOpacity(u8),
+    /// Requested watermark scale is outside `5..=100`.
+    InvalidWatermarkScale(u8),
 }
 
 impl fmt::Display for DomainError {
@@ -151,6 +165,33 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidTint(raw) => {
                 write!(f, "tint must be 3- or 6-digit RGB hex, got '{raw}'")
+            }
+            Self::InvalidDuotone(raw) => {
+                write!(
+                    f,
+                    "duotone must be '<dark_hex>:<light_hex>' RGB hex pair, got '{raw}'"
+                )
+            }
+            Self::InvalidPosterize(val) => {
+                write!(f, "posterize levels must be between 2 and 16, got {val}")
+            }
+            Self::InvalidPixelate(val) => {
+                write!(f, "pixelate block size must be between 2 and 64, got {val}")
+            }
+            Self::InvalidVignette(val) => {
+                write!(f, "vignette strength must be between 0 and 100, got {val}")
+            }
+            Self::InvalidWatermarkName(name) => {
+                write!(
+                    f,
+                    "watermark name '{name}' must be non-empty ASCII letters, digits, '-' or '_'"
+                )
+            }
+            Self::InvalidWatermarkOpacity(val) => {
+                write!(f, "watermark opacity must be between 1 and 100, got {val}")
+            }
+            Self::InvalidWatermarkScale(val) => {
+                write!(f, "watermark scale must be between 5 and 100, got {val}")
             }
         }
     }

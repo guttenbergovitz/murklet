@@ -36,6 +36,15 @@ pub enum EngineError {
     DecodeFailed(String),
     /// Encoding the transformed image into the requested output format failed.
     EncodeFailed(String),
+    /// Requested logical watermark name is not registered in the active policy.
+    UnknownWatermark(String),
+    /// Loading or decoding a configured watermark image at startup failed.
+    WatermarkLoadFailed {
+        /// Logical watermark name from `[watermarks]`.
+        name: String,
+        /// Human-readable cause of the failure.
+        reason: String,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -66,6 +75,10 @@ impl fmt::Display for EngineError {
             ),
             Self::DecodeFailed(reason) => write!(f, "failed to decode image: {reason}"),
             Self::EncodeFailed(reason) => write!(f, "failed to encode image: {reason}"),
+            Self::UnknownWatermark(name) => write!(f, "unknown watermark '{name}'"),
+            Self::WatermarkLoadFailed { name, reason } => {
+                write!(f, "failed to load watermark '{name}': {reason}")
+            }
         }
     }
 }

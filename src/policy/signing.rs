@@ -49,6 +49,32 @@ impl RequestSigner {
         self.sign_canonical(&canonical)
     }
 
+    /// Signs a full URL, `/load?...` path, or bare query string, stripping any
+    /// existing `sig` parameter and appending the freshly computed `sig=<hex>`.
+    #[must_use]
+    pub fn sign_load_url(&self, input: &str) -> String {
+        let trimmed = input.trim();
+        let (prefix, raw_query) = match trimmed.split_once('?') {
+            Some((head, query)) => (Some(head), query),
+            None => (None, trimmed),
+        };
+
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in form_urlencoded::parse(raw_query.as_bytes()) {
+            if key != "sig" {
+                serializer.append_pair(&key, &value);
+            }
+        }
+        let sig = self.sign_raw_query(raw_query);
+        serializer.append_pair("sig", &sig);
+        let signed_query = serializer.finish();
+
+        match prefix {
+            Some(head) => format!("{head}?{signed_query}"),
+            None => signed_query,
+        }
+    }
+
     /// Computes a 64-character lowercase hexadecimal HMAC-SHA256 signature over
     /// an already canonicalised query string.
     #[must_use]
@@ -197,5 +223,20 @@ mod tests {
         assert!(!signer.verify_raw_query(&format!("{base}&sig={sig}&sig={sig}")));
         // Malformed hex fails.
         assert!(!signer.verify_raw_query(&format!("{base}&sig=not-valid-hex")));
+    }
+
+    #[test]
+    fn sign_load_url_preserves_prefix_and_replaces_existing_signature() {
+        let signer = RequestSigner::new(b"cli-secret".to_vec()).unwrap();
+
+        let signed_path = signer.sign_load_url("/load?url=sample.png&w=400&sig=olddeadbeef");
+        assert!(signed_path.starts_with("/load?"));
+        let query = signed_path.split_once('?').unwrap().1;
+        assert!(signer.verify_raw_query(query));
+        assert!(!query.contains("olddeadbeef"));
+
+        let signed_bare = signer.sign_load_url("url=sample.png&w=400");
+        assert!(!signed_bare.contains('?'));
+        assert!(signer.verify_raw_query(&signed_bare));
     }
 }

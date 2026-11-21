@@ -9,4 +9,4 @@ pub mod key;
 pub use coalesce::{Coalesced, Coalescer};
 pub use error::CacheError;
 pub use fs::{CachedVariant, EvictionReport, FsCache};
-pub use key::{CacheKey, compute_etag};
+pub use key::{CacheKey, compute_etag, source_digest_hex};

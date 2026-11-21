@@ -298,6 +298,104 @@ impl FromStr for Sepia {
     }
 }
 
+/// Validated duotone shadow/highlight colour pair (`<dark_hex>:<light_hex>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Duotone {
+    /// Colour mapped to pure shadows (`luma = 0`).
+    pub dark: BackgroundColour,
+    /// Colour mapped to pure highlights (`luma = 255`).
+    pub light: BackgroundColour,
+}
+
+impl FromStr for Duotone {
+    type Err = DomainError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let Some((dark_str, light_str)) = raw.split_once(':') else {
+            return Err(DomainError::InvalidDuotone(raw.to_owned()));
+        };
+        let dark = dark_str
+            .parse::<BackgroundColour>()
+            .map_err(|_| DomainError::InvalidDuotone(raw.to_owned()))?;
+        let light = light_str
+            .parse::<BackgroundColour>()
+            .map_err(|_| DomainError::InvalidDuotone(raw.to_owned()))?;
+        Ok(Self { dark, light })
+    }
+}
+
+/// Validated posterize level count in `2..=16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Posterize(u8);
+
+impl Posterize {
+    /// Constructs a validated posterize level count in `2..=16`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidPosterize`] when outside `2..=16`.
+    pub const fn new(levels: u8) -> Result<Self, DomainError> {
+        if levels < 2 || levels > 16 {
+            return Err(DomainError::InvalidPosterize(levels));
+        }
+        Ok(Self(levels))
+    }
+
+    /// Returns the number of quantisation levels (`2..=16`).
+    #[must_use]
+    pub const fn levels(self) -> u8 {
+        self.0
+    }
+}
+
+/// Validated pixelate block size in `2..=64` pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pixelate(u8);
+
+impl Pixelate {
+    /// Constructs a validated pixelate block size in `2..=64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidPixelate`] when outside `2..=64`.
+    pub const fn new(block_size: u8) -> Result<Self, DomainError> {
+        if block_size < 2 || block_size > 64 {
+            return Err(DomainError::InvalidPixelate(block_size));
+        }
+        Ok(Self(block_size))
+    }
+
+    /// Returns the block width/height in pixels (`2..=64`).
+    #[must_use]
+    pub const fn block_size(self) -> u8 {
+        self.0
+    }
+}
+
+/// Validated vignette intensity in `0..=100` (`0` = disabled).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Vignette(u8);
+
+impl Vignette {
+    /// Constructs a validated vignette intensity in `0..=100`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidVignette`] when above `100`.
+    pub const fn new(strength: u8) -> Result<Self, DomainError> {
+        if strength > 100 {
+            return Err(DomainError::InvalidVignette(strength));
+        }
+        Ok(Self(strength))
+    }
+
+    /// Returns the vignette strength (`0..=100`).
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
 /// Canonical set of image filters executed in a deterministic pipeline order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ImageFilters {
@@ -325,6 +423,16 @@ pub struct ImageFilters {
     pub sepia: Sepia,
     /// Optional brand monochrome tint colour (`black -> base -> white` ramp).
     pub tint: Option<BackgroundColour>,
+    /// Optional duotone shadow/highlight colour pair (`dark -> light` ramp).
+    pub duotone: Option<Duotone>,
+    /// Optional posterize level count (`2..=16`).
+    pub posterize: Option<Posterize>,
+    /// Optional binary luminance threshold (`0..=255`).
+    pub threshold: Option<u8>,
+    /// Optional block pixelation size (`2..=64`).
+    pub pixelate: Option<Pixelate>,
+    /// Radial vignette strength (`0..=100`).
+    pub vignette: Vignette,
 }
 
 impl ImageFilters {
@@ -343,6 +451,11 @@ impl ImageFilters {
             && self.gamma.is_identity()
             && self.sepia.get() == 0
             && self.tint.is_none()
+            && self.duotone.is_none()
+            && self.posterize.is_none()
+            && self.threshold.is_none()
+            && self.pixelate.is_none()
+            && self.vignette.get() == 0
     }
 
     /// Appends canonical filter segments to a cache-key representation string.
@@ -382,6 +495,21 @@ impl ImageFilters {
         }
         if let Some(tint) = self.tint {
             let _ = write!(out, "|tint={}", tint.to_hex());
+        }
+        if let Some(duo) = self.duotone {
+            let _ = write!(out, "|duo={}:{}", duo.dark.to_hex(), duo.light.to_hex());
+        }
+        if let Some(post) = self.posterize {
+            let _ = write!(out, "|post={}", post.levels());
+        }
+        if let Some(thr) = self.threshold {
+            let _ = write!(out, "|thr={thr}");
+        }
+        if let Some(pix) = self.pixelate {
+            let _ = write!(out, "|pix={}", pix.block_size());
+        }
+        if self.vignette.get() != 0 {
+            let _ = write!(out, "|vig={}", self.vignette.get());
         }
     }
 }
@@ -427,6 +555,25 @@ impl fmt::Display for ImageFilters {
         }
         if let Some(tint) = self.tint {
             parts.push(format!("tint={}", tint.to_hex()));
+        }
+        if let Some(duo) = self.duotone {
+            parts.push(format!(
+                "duotone={}:{}",
+                duo.dark.to_hex(),
+                duo.light.to_hex()
+            ));
+        }
+        if let Some(post) = self.posterize {
+            parts.push(format!("posterize={}", post.levels()));
+        }
+        if let Some(thr) = self.threshold {
+            parts.push(format!("threshold={thr}"));
+        }
+        if let Some(pix) = self.pixelate {
+            parts.push(format!("pixelate={}", pix.block_size()));
+        }
+        if self.vignette.get() != 0 {
+            parts.push(format!("vignette={}", self.vignette.get()));
         }
         f.write_str(&parts.join(","))
     }
@@ -500,12 +647,17 @@ mod tests {
             gamma: "1.2".parse().unwrap(),
             sepia: Sepia::new(80).unwrap(),
             tint: Some("0055ff".parse().unwrap()),
+            duotone: Some("112233:ffaa00".parse().unwrap()),
+            posterize: Some(Posterize::new(4).unwrap()),
+            threshold: Some(128),
+            pixelate: Some(Pixelate::new(8).unwrap()),
+            vignette: Vignette::new(50).unwrap(),
         };
         let mut canonical = String::new();
         filters.append_canonical(&mut canonical);
         assert_eq!(
             canonical,
-            "|flip=h|gs=1|inv=1|blur=25|sharp=15|bri=10|con=-5|sat=20|hue=90|gam=12|sep=80|tint=0055ff"
+            "|flip=h|gs=1|inv=1|blur=25|sharp=15|bri=10|con=-5|sat=20|hue=90|gam=12|sep=80|tint=0055ff|duo=112233:ffaa00|post=4|thr=128|pix=8|vig=50"
         );
     }
 }

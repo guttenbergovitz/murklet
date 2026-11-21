@@ -24,12 +24,22 @@ max_entry_bytes = 52428800 # 50 MiB
 # ttl_secs = 2592000 # 30 days
 sweep_interval_secs = 300
 
+[cache.source]
+# Optional raw-source cache for remote HTTP(S) and S3 origins so multiple variants
+# of the same image share a single upstream fetch.
+enabled = false
+dir = "./cache/sources"
+# max_total_bytes = 536870912 # 512 MiB
+# ttl_secs = 3600 # 1 hour
+
 [limits]
 max_input_bytes = 52428800 # 50 MiB
 max_source_dimension = 16384
 max_target_dimension = 8192
 max_decoded_pixels = 64000000
 max_concurrent_transforms = 8
+# Maximum time a request waits for a transform slot before returning 503 Retry-After.
+transform_queue_timeout_secs = 10
 # Fallback for multi-frame GIF/WebP inputs: "first_frame" or "passthrough"
 animation_policy = "first_frame"
 
@@ -64,3 +74,8 @@ connect_timeout_secs = 5
 # width = 300
 # format = "webp"
 # quality = 80
+
+# Optional policy-controlled watermarks referenced via `?wm=<name>`.
+# Each image is validated and decoded once at startup (zero SSRF or path traversal).
+# [watermarks]
+# brand = "./assets/logo.png"

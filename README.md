@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** `v0.4.0` (early release). Implemented and tested: local filesystem, SSRF-hardened HTTP(S), and pure-Rust S3-compatible (`SigV4`) origins; pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), fit/cover/contain/scale-down cropping with gravity & focal points, rotation, DPR, alpha flattening, and post-resize colour/tonal/monochrome filters; sharded filesystem cache with request coalescing, TTL expiry, and disk-budget eviction; declarative TOML configuration with named presets and `murklet explain`; optional HMAC-SHA256 request signing; `Accept` format negotiation; structured `tracing` logs; Prometheus `/metrics`; and Criterion benchmarks. OpenTelemetry exporters remain planned.
+> **Project status:** `v0.5.0` (early release). Implemented and tested: local filesystem, SSRF-hardened HTTP(S), and pure-Rust S3-compatible (`SigV4`) origins; pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), fit/cover/contain/scale-down cropping with gravity & focal points, rotation, DPR, alpha flattening, post-resize colour/tonal/monochrome & creative filters (`duotone`, `posterize`, `threshold`, `pixelate`, `vignette`), and policy-controlled watermarks (`[watermarks]`); sharded filesystem variant & optional raw-source cache with request coalescing, TTL expiry, and disk-budget eviction; transform queue backpressure (`503 Retry-After`); declarative TOML configuration with named presets, `murklet explain`, and `murklet sign`; optional HMAC-SHA256 request signing; `Accept` format negotiation; structured `tracing` logs; Prometheus `/metrics`; and Criterion benchmarks. OpenTelemetry exporters remain planned.
 
 ## Motivation
 
@@ -180,7 +180,7 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cle
 To build a minimal container image:
 
 ```bash
-docker build -t murklet:0.4.0 .
+docker build -t murklet:0.5.0 .
 ```
 
 ## Documentation

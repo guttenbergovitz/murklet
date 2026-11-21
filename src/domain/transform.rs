@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::domain::error::{Axis, DomainError};
 use crate::domain::filters::ImageFilters;
 use crate::domain::geometry::{BackgroundColour, FitMode, Gravity, Rotation};
+use crate::domain::watermark::WatermarkSpec;
 
 /// Default maximum width or height accepted by baseline transformation requests.
 pub const DEFAULT_MAX_DIMENSION: u32 = 8192;
@@ -396,7 +397,7 @@ impl fmt::Display for SelectedFilter {
 }
 
 /// Canonical, transport-agnostic specification of an image transformation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct TransformSpec {
     /// Optional target width and height.
     pub dimensions: TargetDimensions,
@@ -416,6 +417,8 @@ pub struct TransformSpec {
     pub background: Option<BackgroundColour>,
     /// Post-resize pixel filters and mirror flip.
     pub filters: ImageFilters,
+    /// Optional policy-controlled watermark overlay.
+    pub watermark: Option<WatermarkSpec>,
 }
 
 impl TransformSpec {
@@ -469,6 +472,9 @@ impl TransformSpec {
             out.push_str(&bg.to_hex());
         }
         self.filters.append_canonical(&mut out);
+        if let Some(ref wm) = self.watermark {
+            wm.append_canonical(&mut out);
+        }
         out
     }
 }
@@ -666,7 +672,7 @@ mod tests {
         };
         let png_high_q = TransformSpec {
             quality: Quality::new(95).unwrap(),
-            ..png_low_q
+            ..png_low_q.clone()
         };
 
         assert_eq!(

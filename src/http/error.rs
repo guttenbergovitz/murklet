@@ -3,7 +3,8 @@
 //! Internal host paths and raw I/O details are intentionally withheld from client
 //! responses to prevent information disclosure.
 
-use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::cache::CacheError;
@@ -32,6 +33,11 @@ pub enum HttpError {
     NotImplemented(String),
     /// Upstream origin failed or returned an unexpected response (`502 Bad Gateway`).
     BadGateway(String),
+    /// Transform queue is saturated and timed out waiting for capacity (`503 Service Unavailable`).
+    ServiceUnavailable {
+        /// Suggested retry delay emitted in the `Retry-After` response header.
+        retry_after_secs: u64,
+    },
     /// Upstream origin timed out (`504 Gateway Timeout`).
     GatewayTimeout,
     /// Unexpected internal processing or storage error (`500 Internal Server Error`).
@@ -82,7 +88,12 @@ impl From<EngineError> for HttpError {
             EngineError::SourceDimensionLimitExceeded { .. }
             | EngineError::DecodedPixelLimitExceeded { .. }
             | EngineError::DecodeFailed(_) => Self::UnprocessableEntity(err.to_string()),
-            EngineError::EncodeFailed(_) => Self::Internal,
+            EngineError::UnknownWatermark(name) => {
+                Self::BadRequest(format!("unknown watermark '{name}'"))
+            }
+            EngineError::EncodeFailed(_) | EngineError::WatermarkLoadFailed { .. } => {
+                Self::Internal
+            }
         }
     }
 }
@@ -95,26 +106,41 @@ impl From<CacheError> for HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorised".to_owned()),
-            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
-            Self::NotFound => (StatusCode::NOT_FOUND, "image not found".to_owned()),
-            Self::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
-            Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg),
-            Self::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
-            Self::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
-            Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
+        match self {
+            Self::ServiceUnavailable { retry_after_secs } => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "image transformation queue busy; please retry shortly",
+                )
+                    .into_response();
+                if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    response.headers_mut().insert(RETRY_AFTER, value);
+                }
+                response
+            }
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorised").into_response(),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
+            Self::NotFound => (StatusCode::NOT_FOUND, "image not found").into_response(),
+            Self::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response(),
+            Self::UnsupportedMediaType(msg) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg).into_response()
+            }
+            Self::UnprocessableEntity(msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+            }
+            Self::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg).into_response(),
+            Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
             Self::GatewayTimeout => (
                 StatusCode::GATEWAY_TIMEOUT,
-                "upstream origin request timed out".to_owned(),
-            ),
+                "upstream origin request timed out",
+            )
+                .into_response(),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal image processing error".to_owned(),
-            ),
-        };
-
-        (status, message).into_response()
+                "internal image processing error",
+            )
+                .into_response(),
+        }
     }
 }

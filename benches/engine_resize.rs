@@ -52,7 +52,7 @@ fn bench_engine_transforms(c: &mut Criterion) {
 
     let jpeg_bilinear = TransformSpec {
         filter: Some(ResizeFilter::Linear),
-        ..jpeg_lanczos
+        ..jpeg_lanczos.clone()
     };
     group.bench_function("jpeg_linear", |b| {
         b.iter(|| transform(black_box(&source), black_box(&jpeg_bilinear), &limits).unwrap());
@@ -60,7 +60,7 @@ fn bench_engine_transforms(c: &mut Criterion) {
 
     let webp_lanczos = TransformSpec {
         format: OutputFormat::Webp,
-        ..jpeg_lanczos
+        ..jpeg_lanczos.clone()
     };
     group.bench_function("webp_lanczos", |b| {
         b.iter(|| transform(black_box(&source), black_box(&webp_lanczos), &limits).unwrap());

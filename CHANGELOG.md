@@ -4,6 +4,14 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-21
+
+### Added
+
+- **Creative post-resize filters (`src/domain/filters.rs`, `src/engine/pipeline.rs`):** Added `duotone` (`<dark_hex>:<light_hex>`), `posterize` (`2..=16`), `threshold` (`0..=255`), `pixelate` (`2..=64`), and `vignette` (`0..=100`) in Murklet's fixed canonical pipeline order, wired into `[presets.*]` and `murklet explain`.
+- **Policy-controlled watermarks (`src/domain/watermark.rs`, `src/engine/watermark.rs`, `src/policy/config.rs`):** Added declarative `[watermarks]` mapping validated logical names to local image files loaded and decoded once at startup under `EngineLimits` (zero runtime I/O, zero SSRF or path traversal), with `wm`/`watermark`, `wm_pos` (with 2% edge margin for non-centred anchors), `wm_opacity` (`1..=100`), and `wm_scale` (`5..=100`) query and preset parameters and SIMD `fast_image_resize` + Porter-Duff `source-over` compositing.
+- **Production hardening (`src/cache/fs.rs`, `src/http/router.rs`, `src/main.rs`):** Added optional raw-source cache (`[cache.source]`) for remote HTTP(S) and S3 origins, transform queue backpressure (`limits.transform_queue_timeout_secs` returning `503 Service Unavailable` with `Retry-After`), and the `murklet sign <url> [config]` CLI command.
+
 ## [0.4.0] - 2026-11-21
 
 ### Added

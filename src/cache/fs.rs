@@ -107,7 +107,50 @@ impl FsCache {
     /// or [`CacheError::Io`] on unexpected filesystem errors.
     pub fn get(&self, key: &CacheKey) -> Result<Option<CachedVariant>, CacheError> {
         let path = self.entry_path(key);
-        let file = match File::open(&path) {
+        let Some(bytes) = self.read_entry_bytes(&path)? else {
+            return Ok(None);
+        };
+        let etag = compute_etag(&bytes);
+        Ok(Some(CachedVariant {
+            bytes,
+            format: key.format(),
+            etag,
+        }))
+    }
+
+    /// Looks up raw source bytes stored under a 64-character hex digest (`<shard>/<digest>.src`).
+    ///
+    /// Returns `Ok(None)` on cache miss or TTL expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::EntryTooLarge`] or [`CacheError::Io`] on failure.
+    pub fn get_raw(&self, digest_hex: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        let path = self.raw_entry_path(digest_hex);
+        self.read_entry_bytes(&path)
+    }
+
+    /// Stores raw source bytes atomically under `<shard>/<digest>.src`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::EntryTooLarge`] if `bytes.len() > max_entry_bytes`, or
+    /// [`CacheError::Io`] on filesystem failure.
+    pub fn put_raw(&self, digest_hex: &str, bytes: &[u8]) -> Result<(), CacheError> {
+        if bytes.len() > self.max_entry_bytes {
+            return Err(CacheError::EntryTooLarge {
+                size: bytes.len(),
+                max: self.max_entry_bytes,
+            });
+        }
+        let shard = digest_hex.get(..2).unwrap_or("00");
+        let shard_dir = self.root.join(shard);
+        let final_path = shard_dir.join(format!("{digest_hex}.src"));
+        Self::write_entry_atomic(&shard_dir, digest_hex, &final_path, bytes)
+    }
+
+    fn read_entry_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
+        let file = match File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(CacheError::Io(err.kind().to_string())),
@@ -124,7 +167,7 @@ impl FsCache {
                 .is_ok_and(|age| age >= ttl)
         {
             drop(file);
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Ok(None);
         }
 
@@ -157,12 +200,39 @@ impl FsCache {
             });
         }
 
-        let etag = compute_etag(&bytes);
-        Ok(Some(CachedVariant {
-            bytes,
-            format: key.format(),
-            etag,
-        }))
+        Ok(Some(bytes))
+    }
+
+    fn write_entry_atomic(
+        shard_dir: &Path,
+        tmp_prefix: &str,
+        final_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), CacheError> {
+        fs::create_dir_all(shard_dir).map_err(|err| CacheError::Io(err.kind().to_string()))?;
+
+        let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp_path = shard_dir.join(format!(".{tmp_prefix}.tmp-{pid}-{seq}"));
+
+        let write_result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            drop(file);
+            fs::rename(&tmp_path, final_path)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(CacheError::Io(err.kind().to_string()));
+        }
+
+        Ok(())
     }
 
     /// Stores encoded variant bytes atomically via a temporary file and rename.
@@ -183,29 +253,8 @@ impl FsCache {
         }
 
         let shard_dir = self.root.join(key.shard_dir());
-        fs::create_dir_all(&shard_dir).map_err(|err| CacheError::Io(err.kind().to_string()))?;
-
-        let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let tmp_path = shard_dir.join(format!(".{}.tmp-{pid}-{seq}", key.digest_hex()));
         let final_path = shard_dir.join(key.file_name());
-
-        let write_result = (|| -> io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            file.write_all(bytes)?;
-            file.flush()?;
-            drop(file);
-            fs::rename(&tmp_path, &final_path)?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(CacheError::Io(err.kind().to_string()));
-        }
+        Self::write_entry_atomic(&shard_dir, key.digest_hex(), &final_path, bytes)?;
 
         let etag = compute_etag(bytes);
         Ok(CachedVariant {
@@ -307,6 +356,11 @@ impl FsCache {
 
     fn entry_path(&self, key: &CacheKey) -> PathBuf {
         self.root.join(key.shard_dir()).join(key.file_name())
+    }
+
+    fn raw_entry_path(&self, digest_hex: &str) -> PathBuf {
+        let shard = digest_hex.get(..2).unwrap_or("00");
+        self.root.join(shard).join(format!("{digest_hex}.src"))
     }
 }
 
@@ -606,5 +660,32 @@ mod tests {
         assert!(cache.get(&k2).unwrap().is_some());
         assert!(cache.get(&k3).unwrap().is_some());
         assert!(hidden_tmp.exists());
+    }
+
+    #[test]
+    fn raw_source_cache_round_trips_and_respects_ttl() {
+        let temp = TempCacheDir::new("raw-source");
+        let cache = FsCache::new(&temp.path, 4096)
+            .unwrap()
+            .with_ttl(Some(Duration::from_secs(60)));
+
+        let digest = crate::cache::source_digest_hex("s3", "s3://photos/hero.jpg");
+        assert_eq!(cache.get_raw(&digest).unwrap(), None);
+
+        cache.put_raw(&digest, b"raw-upstream-jpeg-bytes").unwrap();
+        assert_eq!(
+            cache.get_raw(&digest).unwrap().as_deref(),
+            Some(b"raw-upstream-jpeg-bytes".as_slice())
+        );
+
+        let two_mins_ago = SystemTime::now() - Duration::from_secs(120);
+        OpenOptions::new()
+            .write(true)
+            .open(cache.raw_entry_path(&digest))
+            .unwrap()
+            .set_modified(two_mins_ago)
+            .unwrap();
+
+        assert_eq!(cache.get_raw(&digest).unwrap(), None);
     }
 }
