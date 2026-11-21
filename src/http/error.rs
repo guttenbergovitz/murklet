@@ -30,6 +30,10 @@ pub enum HttpError {
     UnprocessableEntity(String),
     /// Requested operation is not yet implemented (`501 Not Implemented`).
     NotImplemented(String),
+    /// Upstream origin failed or returned an unexpected response (`502 Bad Gateway`).
+    BadGateway(String),
+    /// Upstream origin timed out (`504 Gateway Timeout`).
+    GatewayTimeout,
     /// Unexpected internal processing or storage error (`500 Internal Server Error`).
     Internal,
 }
@@ -47,8 +51,17 @@ impl From<OriginError> for HttpError {
             OriginError::PathEscapesRoot => {
                 Self::Forbidden("requested path is outside the allowed origin root".to_owned())
             }
-            // Treat directories and non-regular files as 404 to avoid leaking filesystem layout.
-            OriginError::NotFound | OriginError::NotRegularFile => Self::NotFound,
+            OriginError::HostNotAllowed | OriginError::ForbiddenIpAddress => {
+                Self::Forbidden(err.to_string())
+            }
+            // Treat directories, non-regular files, and upstream 404s as 404.
+            OriginError::NotFound
+            | OriginError::NotRegularFile
+            | OriginError::UpstreamStatus(404) => Self::NotFound,
+            OriginError::TooManyRedirects { .. } | OriginError::UpstreamStatus(_) => {
+                Self::BadGateway(err.to_string())
+            }
+            OriginError::Timeout => Self::GatewayTimeout,
             OriginError::PayloadTooLarge { size, max } => Self::PayloadTooLarge(format!(
                 "source image ({size} bytes) exceeds limit of {max} bytes"
             )),
@@ -91,6 +104,11 @@ impl IntoResponse for HttpError {
             Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg),
             Self::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             Self::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
+            Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
+            Self::GatewayTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream origin request timed out".to_owned(),
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal image processing error".to_owned(),
