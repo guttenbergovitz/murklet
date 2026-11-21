@@ -1,0 +1,36 @@
+# Rust build artefacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Temporary working specs (isolated spec-driven scratch area)
+.specs/*
+!.specs/README.md
+
+# AI agent local state and scratch files
+.agent/
+.agents/
+.aider*
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.gemini/
+.windsurf/
+AGENTS.local.md
+CLAUDE.local.md
+*.scratch.md
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
