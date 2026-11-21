@@ -18,6 +18,11 @@ diagnostic_headers = false
 [cache]
 dir = "./cache"
 max_entry_bytes = 52428800 # 50 MiB
+# Optional disk budget in bytes; oldest entries are evicted when exceeded.
+# max_total_bytes = 1073741824 # 1 GiB
+# Optional entry TTL in seconds; expired entries are evicted lazily and on sweeps.
+# ttl_secs = 2592000 # 30 days
+sweep_interval_secs = 300
 
 [limits]
 max_input_bytes = 52428800 # 50 MiB
