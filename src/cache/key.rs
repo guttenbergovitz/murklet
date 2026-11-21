@@ -6,6 +6,7 @@ use crate::domain::{OutputFormat, TransformSpec};
 /// and canonical [`TransformSpec`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    source_digest_hex: String,
     digest_hex: String,
     format: OutputFormat,
 }
@@ -15,6 +16,8 @@ impl CacheKey {
     /// differing `(origin_id, source_key)` splits can never collide.
     #[must_use]
     pub fn from_parts(origin_id: &str, source_key: &str, spec: &TransformSpec) -> Self {
+        let source_digest_hex = source_digest_hex(origin_id, source_key);
+
         let mut hasher = blake3::Hasher::new();
         update_length_prefixed(&mut hasher, origin_id.as_bytes());
         update_length_prefixed(&mut hasher, source_key.as_bytes());
@@ -23,12 +26,19 @@ impl CacheKey {
         let digest_hex = hasher.finalize().to_hex().to_string();
 
         Self {
+            source_digest_hex,
             digest_hex,
             format: spec.format,
         }
     }
 
-    /// Returns the full 64-character lowercase hexadecimal BLAKE3 digest.
+    /// Returns the 64-character lowercase hexadecimal BLAKE3 digest identifying the source asset.
+    #[must_use]
+    pub fn source_digest_hex(&self) -> &str {
+        &self.source_digest_hex
+    }
+
+    /// Returns the full 64-character lowercase hexadecimal BLAKE3 digest of this variant.
     #[must_use]
     pub fn digest_hex(&self) -> &str {
         &self.digest_hex
@@ -40,11 +50,11 @@ impl CacheKey {
         self.format
     }
 
-    /// Returns the 2-character hexadecimal shard prefix used to fan out files
-    /// across subdirectories on disk.
+    /// Returns the 2-character hexadecimal shard prefix derived from the source digest
+    /// so all variants of the same source asset live under a single purgeable bucket.
     #[must_use]
     pub fn shard_dir(&self) -> &str {
-        self.digest_hex.get(..2).unwrap_or("00")
+        self.source_digest_hex.get(..2).unwrap_or("00")
     }
 
     /// Returns the canonical filename (`<digest>.<ext>`) stored inside the shard directory.

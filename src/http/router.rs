@@ -190,6 +190,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/load", get(load_handler))
         .route("/cache/cleanup", post(cleanup_handler))
+        .route("/cache/purge", post(purge_handler))
         .with_state(state)
 }
 
@@ -682,11 +683,7 @@ struct CleanupQuery {
     url: Option<String>,
 }
 
-async fn cleanup_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<CleanupQuery>,
-) -> Result<Response, HttpError> {
+fn verify_cleanup_token(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
     let expected = state
         .cleanup_token
         .as_deref()
@@ -701,11 +698,77 @@ async fn cleanup_handler(
     if !constant_time_token_eq(supplied, expected) {
         return Err(HttpError::Unauthorized);
     }
+    Ok(())
+}
 
-    if query.url.as_deref().is_some_and(|url| !url.is_empty()) {
-        return Err(HttpError::NotImplemented(
-            "per-URL cache cleanup is not yet implemented".to_owned(),
-        ));
+async fn purge_source_entries(state: &Arc<AppState>, source_url: &str) -> Result<u64, HttpError> {
+    let origin_id = if is_http_source(source_url) {
+        HTTP_ORIGIN_ID
+    } else if is_s3_source(source_url) {
+        S3_ORIGIN_ID
+    } else {
+        LOCAL_ORIGIN_ID
+    };
+    let digest = source_digest_hex(origin_id, source_url);
+
+    let cache = state.cache.clone();
+    let source_cache = state.source_cache.clone();
+    let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
+        let mut count = cache.purge_source(&digest)?;
+        if let Some(src_cache) = source_cache
+            && src_cache.delete_raw(&digest)?
+        {
+            count += 1;
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|_| HttpError::Internal)??;
+
+    state.metrics.record_cache_cleanup();
+    tracing::info!(
+        origin = origin_id,
+        removed_files = removed,
+        "selective cache purge completed"
+    );
+
+    Ok(removed)
+}
+
+async fn purge_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CleanupQuery>,
+) -> Result<Response, HttpError> {
+    verify_cleanup_token(&state, &headers)?;
+    let url = query
+        .url
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
+
+    let removed = purge_source_entries(&state, url).await?;
+    Ok((
+        StatusCode::OK,
+        format!("Purged {removed} cached entries for source"),
+    )
+        .into_response())
+}
+
+async fn cleanup_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CleanupQuery>,
+) -> Result<Response, HttpError> {
+    verify_cleanup_token(&state, &headers)?;
+
+    if let Some(url) = query.url.as_deref().filter(|url| !url.is_empty()) {
+        let removed = purge_source_entries(&state, url).await?;
+        return Ok((
+            StatusCode::OK,
+            format!("Purged {removed} cached entries for source"),
+        )
+            .into_response());
     }
 
     let cache = state.cache.clone();
@@ -1133,21 +1196,6 @@ mod tests {
             .unwrap();
         assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
-        // Per-URL cleanup returns 501.
-        let per_url = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/cache/cleanup?url=sample.png")
-                    .header("x-cache-cleanup-token", "s3cr3t-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(per_url.status(), StatusCode::NOT_IMPLEMENTED);
-
         // Valid full cleanup returns 200 and clears cached entries.
         let cleaned = app
             .clone()
@@ -1574,5 +1622,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(override_attempt.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn purge_removes_single_source_variants_without_touching_others() {
+        let fixture = TestFixture::new("selective-purge");
+        std::fs::copy(
+            fixture.origin_dir.join("sample.png"),
+            fixture.origin_dir.join("keep.png"),
+        )
+        .unwrap();
+        let mut state = fixture.state();
+        state.cleanup_token = Some("s3cr3t-token".to_owned());
+        let app = build_router(Arc::new(state));
+
+        for uri in [
+            "/load?url=sample.png&w=40&f=jpeg",
+            "/load?url=sample.png&w=20&f=webp",
+            "/load?url=keep.png&w=40&f=jpeg",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers().get("x-cache").unwrap(), "MISS");
+        }
+
+        // `/cache/purge` requires `url`.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cache/purge")
+                    .header("x-cache-cleanup-token", "s3cr3t-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // Purging `sample.png` removes both its JPEG and WebP variants while `keep.png` stays HIT.
+        let purged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cache/purge?url=sample.png")
+                    .header("x-cache-cleanup-token", "s3cr3t-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purged.status(), StatusCode::OK);
+
+        let sample_jpg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sample_jpg.headers().get("x-cache").unwrap(), "MISS");
+
+        let keep_jpg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=keep.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(keep_jpg.headers().get("x-cache").unwrap(), "HIT");
+
+        // `/cache/cleanup?url=keep.png` performs the same selective purge.
+        let via_cleanup = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cache/cleanup?url=keep.png")
+                    .header("x-cache-cleanup-token", "s3cr3t-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_cleanup.status(), StatusCode::OK);
     }
 }
