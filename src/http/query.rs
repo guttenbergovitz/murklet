@@ -3,9 +3,10 @@
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
-    Flip, Gamma, Gravity, Hue, ImageFilters, OutputFormat, Quality, ResizeFilter, Rotation,
-    Saturation, Sepia, SharpenSigma, TargetDimensions, TransformSpec,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, Duotone,
+    FitMode, Flip, Gamma, Gravity, Hue, ImageFilters, OutputFormat, Pixelate, Posterize, Quality,
+    ResizeFilter, Rotation, Saturation, Sepia, SharpenSigma, TargetDimensions, TransformSpec,
+    Vignette,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -64,6 +65,16 @@ pub struct RawLoadQuery {
     /// Optional brand monochrome tint colour (3- or 6-digit RGB hex).
     #[serde(alias = "mono", alias = "monochrome")]
     pub tint: Option<String>,
+    /// Optional duotone colour pair (`<dark_hex>:<light_hex>`).
+    pub duotone: Option<String>,
+    /// Optional posterize level count (`2..=16`).
+    pub posterize: Option<String>,
+    /// Optional binary luminance threshold (`0..=255`).
+    pub threshold: Option<String>,
+    /// Optional block pixelation size (`2..=64`).
+    pub pixelate: Option<String>,
+    /// Optional radial vignette strength (`0..=100`).
+    pub vignette: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -270,7 +281,7 @@ fn parse_image_filters(
         ),
     };
 
-    Ok(ImageFilters {
+    let mut filters = ImageFilters {
         flip,
         grayscale,
         invert,
@@ -283,6 +294,45 @@ fn parse_image_filters(
         gamma,
         sepia,
         tint,
+        ..ImageFilters::default()
+    };
+    populate_creative_filters(raw, preset, &mut filters)?;
+    Ok(filters)
+}
+
+fn populate_creative_filters(
+    raw: &RawLoadQuery,
+    preset: &ValidatedPreset,
+    filters: &mut ImageFilters,
+) -> Result<(), HttpError> {
+    filters.duotone = match raw.duotone.as_deref() {
+        None | Some("") => preset.duotone,
+        Some(value) => Some(value.parse::<Duotone>()?),
+    };
+    filters.posterize = match raw.posterize.as_deref() {
+        None | Some("") => preset.posterize,
+        Some(value) => Some(Posterize::new(parse_u8_param("posterize", value, 2, 16)?)?),
+    };
+    filters.threshold = match raw.threshold.as_deref() {
+        None | Some("") => preset.threshold,
+        Some(value) => Some(parse_u8_param("threshold", value, 0, 255)?),
+    };
+    filters.pixelate = match raw.pixelate.as_deref() {
+        None | Some("") => preset.pixelate,
+        Some(value) => Some(Pixelate::new(parse_u8_param("pixelate", value, 2, 64)?)?),
+    };
+    filters.vignette = match raw.vignette.as_deref() {
+        None | Some("") => preset.vignette.unwrap_or_default(),
+        Some(value) => Vignette::new(parse_u8_param("vignette", value, 0, 100)?)?,
+    };
+    Ok(())
+}
+
+fn parse_u8_param(name: &str, raw: &str, min: u8, max: u8) -> Result<u8, HttpError> {
+    raw.parse::<u8>().map_err(|_| {
+        HttpError::BadRequest(format!(
+            "query parameter '{name}' must be an integer between {min} and {max}, got '{raw}'"
+        ))
     })
 }
 

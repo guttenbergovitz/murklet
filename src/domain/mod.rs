@@ -10,8 +10,8 @@ pub mod transform;
 
 pub use error::{Axis, DomainError};
 pub use filters::{
-    BlurSigma, Brightness, Contrast, Flip, Gamma, Hue, ImageFilters, Saturation, Sepia,
-    SharpenSigma,
+    BlurSigma, Brightness, Contrast, Duotone, Flip, Gamma, Hue, ImageFilters, Pixelate, Posterize,
+    Saturation, Sepia, SharpenSigma, Vignette,
 };
 pub use geometry::{
     BackgroundColour, CropRect, Dpr, FitMode, Gravity, ResizePlan, Rotation, plan_resize,

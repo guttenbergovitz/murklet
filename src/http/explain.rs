@@ -255,6 +255,11 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "gamma" => out.gamma = Some(value.into_owned()),
             "sepia" => out.sepia = Some(value.into_owned()),
             "tint" | "mono" | "monochrome" => out.tint = Some(value.into_owned()),
+            "duotone" => out.duotone = Some(value.into_owned()),
+            "posterize" => out.posterize = Some(value.into_owned()),
+            "threshold" => out.threshold = Some(value.into_owned()),
+            "pixelate" => out.pixelate = Some(value.into_owned()),
+            "vignette" => out.vignette = Some(value.into_owned()),
             _ => {}
         }
     }

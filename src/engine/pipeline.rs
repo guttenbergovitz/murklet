@@ -17,8 +17,8 @@ use image::{
 };
 
 use crate::domain::{
-    BackgroundColour, Flip, ImageDimensions, ImageFilters, OutputFormat, ResizeFilter, Rotation,
-    SelectedFilter, TransformSpec, plan_resize,
+    BackgroundColour, Duotone, Flip, ImageDimensions, ImageFilters, OutputFormat, ResizeFilter,
+    Rotation, SelectedFilter, TransformSpec, plan_resize,
 };
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
@@ -325,14 +325,29 @@ fn apply_pixel_filters(mut image: DynamicImage, filters: &ImageFilters) -> Dynam
     if let Some(tint) = filters.tint {
         image = apply_monochrome_tint(image, tint);
     }
+    if let Some(duotone) = filters.duotone {
+        image = apply_duotone(image, duotone);
+    }
+    if let Some(posterize) = filters.posterize {
+        image = apply_posterize(image, posterize.levels());
+    }
+    if let Some(threshold) = filters.threshold {
+        image = apply_threshold(image, threshold);
+    }
     if filters.invert {
         image.invert();
+    }
+    if let Some(pixelate) = filters.pixelate {
+        image = apply_pixelate(image, u32::from(pixelate.block_size()));
     }
     if let Some(blur) = filters.blur {
         image = image.fast_blur(blur.as_f32());
     }
     if let Some(sharpen) = filters.sharpen {
         image = image.unsharpen(sharpen.as_f32(), 1);
+    }
+    if filters.vignette.get() != 0 {
+        image = apply_vignette(image, filters.vignette.get());
     }
     image
 }
@@ -433,6 +448,123 @@ fn apply_monochrome_tint(image: DynamicImage, tint: BackgroundColour) -> Dynamic
         };
         [ramp(tint.r), ramp(tint.g), ramp(tint.b)]
     })
+}
+
+/// Maps Rec.709 luminance linearly between `duotone.dark` (`luma = 0`) and `duotone.light` (`luma = 255`).
+fn apply_duotone(image: DynamicImage, duotone: Duotone) -> DynamicImage {
+    map_rgb_pixels(image, |[r, g, b]| {
+        let luma = (54 * u32::from(r) + 183 * u32::from(g) + 19 * u32::from(b) + 128) >> 8;
+        let inv = 255 - luma;
+        let lerp = |dark: u8, light: u8| -> u8 {
+            let mixed = (u32::from(dark) * inv + u32::from(light) * luma + 127) / 255;
+            u8::try_from(mixed).unwrap_or(255)
+        };
+        [
+            lerp(duotone.dark.r, duotone.light.r),
+            lerp(duotone.dark.g, duotone.light.g),
+            lerp(duotone.dark.b, duotone.light.b),
+        ]
+    })
+}
+
+/// Quantises each RGB channel into `levels` discrete steps (`2..=16`) using a 256-byte LUT.
+fn apply_posterize(image: DynamicImage, levels: u8) -> DynamicImage {
+    let steps = f32::from(levels.saturating_sub(1).max(1));
+    let mut lut = [0_u8; 256];
+    for (idx, slot) in lut.iter_mut().enumerate() {
+        let norm = f32::from(u8::try_from(idx).unwrap_or(255)) / 255.0;
+        let quantised = (norm * steps).round() / steps;
+        *slot = clamp_f32_to_u8(quantised * 255.0);
+    }
+    map_rgb_pixels(image, |[r, g, b]| {
+        [
+            lut[usize::from(r)],
+            lut[usize::from(g)],
+            lut[usize::from(b)],
+        ]
+    })
+}
+
+/// Binarises pixels into pure black or pure white based on Rec.709 luminance `>= threshold`.
+fn apply_threshold(image: DynamicImage, threshold: u8) -> DynamicImage {
+    let limit = u32::from(threshold);
+    map_rgb_pixels(image, |[r, g, b]| {
+        let luma = (54 * u32::from(r) + 183 * u32::from(g) + 19 * u32::from(b) + 128) >> 8;
+        let v = if luma >= limit { 255 } else { 0 };
+        [v, v, v]
+    })
+}
+
+/// Replaces each `block_size × block_size` tile with its average RGB colour while preserving alpha.
+fn apply_pixelate(image: DynamicImage, block_size: u32) -> DynamicImage {
+    let mut rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    let mut by = 0;
+    while by < height {
+        let y_end = by.saturating_add(block_size).min(height);
+        let mut bx = 0;
+        while bx < width {
+            let x_end = bx.saturating_add(block_size).min(width);
+            let (mut sr, mut sg, mut sb, mut count) = (0_u64, 0_u64, 0_u64, 0_u64);
+            for y in by..y_end {
+                for x in bx..x_end {
+                    let [r, g, b, _] = rgba.get_pixel(x, y).0;
+                    sr += u64::from(r);
+                    sg += u64::from(g);
+                    sb += u64::from(b);
+                    count += 1;
+                }
+            }
+            if let (Some(ar_u64), Some(ag_u64), Some(ab_u64)) = (
+                sr.checked_div(count),
+                sg.checked_div(count),
+                sb.checked_div(count),
+            ) {
+                let ar = u8::try_from(ar_u64).unwrap_or(255);
+                let ag = u8::try_from(ag_u64).unwrap_or(255);
+                let ab = u8::try_from(ab_u64).unwrap_or(255);
+                for y in by..y_end {
+                    for x in bx..x_end {
+                        let px = rgba.get_pixel_mut(x, y);
+                        px.0[0] = ar;
+                        px.0[1] = ag;
+                        px.0[2] = ab;
+                    }
+                }
+            }
+            bx = x_end;
+        }
+        by = y_end;
+    }
+
+    DynamicImage::ImageRgba8(rgba)
+}
+
+/// Applies smooth radial elliptical edge darkening (`strength` in `1..=100`) while preserving alpha.
+#[allow(clippy::cast_precision_loss)]
+fn apply_vignette(image: DynamicImage, strength: u8) -> DynamicImage {
+    let mut rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let cx = (width as f32) * 0.5;
+    let cy = (height as f32) * 0.5;
+    if cx <= 0.0 || cy <= 0.0 {
+        return DynamicImage::ImageRgba8(rgba);
+    }
+    let intensity = f32::from(strength) / 100.0;
+
+    for (x, y, px) in rgba.enumerate_pixels_mut() {
+        let dx = ((x as f32 + 0.5) - cx) / cx;
+        let dy = ((y as f32 + 0.5) - cy) / cy;
+        // Normalised radial distance squared (0 at centre, ~2 at corners).
+        let d2 = (dx * dx + dy * dy) * 0.5;
+        let factor = (1.0 - intensity * d2).clamp(0.0, 1.0);
+        px.0[0] = clamp_f32_to_u8(f32::from(px.0[0]) * factor);
+        px.0[1] = clamp_f32_to_u8(f32::from(px.0[1]) * factor);
+        px.0[2] = clamp_f32_to_u8(f32::from(px.0[2]) * factor);
+    }
+
+    DynamicImage::ImageRgba8(rgba)
 }
 
 /// Composites an alpha-bearing image over a solid RGB background colour using
@@ -901,5 +1033,74 @@ mod tests {
         };
         let combo = transform(&solid_png, &combo_spec, &EngineLimits::default()).unwrap();
         assert!(!combo.bytes.is_empty());
+    }
+
+    #[test]
+    fn duotone_threshold_posterize_pixelate_and_vignette_work_deterministically() {
+        use crate::domain::{Pixelate, Posterize, Vignette};
+
+        // 4x1 strip: black, dark-grey, light-grey, white (alpha=200).
+        let mut strip = RgbaImage::new(4, 1);
+        strip.put_pixel(0, 0, Rgba([0, 0, 0, 200]));
+        strip.put_pixel(1, 0, Rgba([80, 80, 80, 200]));
+        strip.put_pixel(2, 0, Rgba([180, 180, 180, 200]));
+        strip.put_pixel(3, 0, Rgba([255, 255, 255, 200]));
+        let mut strip_png = Vec::new();
+        DynamicImage::ImageRgba8(strip)
+            .write_to(&mut Cursor::new(&mut strip_png), ImageFormat::Png)
+            .unwrap();
+
+        // Duotone maps luma=0 -> dark (#102030) and luma=255 -> light (#f0e0d0), keeping alpha.
+        let duo_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                duotone: Some("102030:f0e0d0".parse().unwrap()),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let duo = transform(&strip_png, &duo_spec, &EngineLimits::default()).unwrap();
+        let duo_img = ImageReader::new(Cursor::new(&duo.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(duo_img.get_pixel(0, 0).0, [0x10, 0x20, 0x30, 200]);
+        assert_eq!(duo_img.get_pixel(3, 0).0, [0xf0, 0xe0, 0xd0, 200]);
+
+        // Threshold at 128 turns 0/80 -> 0 and 180/255 -> 255.
+        let thr_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                threshold: Some(128),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let thr = transform(&strip_png, &thr_spec, &EngineLimits::default()).unwrap();
+        let thr_img = ImageReader::new(Cursor::new(&thr.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(thr_img.get_pixel(1, 0).0, [0, 0, 0, 200]);
+        assert_eq!(thr_img.get_pixel(2, 0).0, [255, 255, 255, 200]);
+
+        // Posterize + pixelate + vignette execute cleanly on a 16x16 image.
+        let img = make_png(16, 16);
+        let creative_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                posterize: Some(Posterize::new(4).unwrap()),
+                pixelate: Some(Pixelate::new(4).unwrap()),
+                vignette: Vignette::new(60).unwrap(),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let out = transform(&img, &creative_spec, &EngineLimits::default()).unwrap();
+        assert!(!out.bytes.is_empty());
     }
 }

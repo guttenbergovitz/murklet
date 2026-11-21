@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
-    Flip, Gamma, Gravity, Hue, OutputFormat, Quality, ResizeFilter, Rotation, Saturation, Sepia,
-    SharpenSigma,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, Duotone,
+    FitMode, Flip, Gamma, Gravity, Hue, OutputFormat, Pixelate, Posterize, Quality, ResizeFilter,
+    Rotation, Saturation, Sepia, SharpenSigma, Vignette,
 };
 use crate::policy::error::PolicyError;
 
@@ -60,6 +60,16 @@ pub struct PresetConfig {
     /// Optional RGB hex brand monochrome tint colour (for example `"1a73e8"`).
     #[serde(alias = "mono", alias = "monochrome")]
     pub tint: Option<String>,
+    /// Optional duotone colour pair (`"<dark_hex>:<light_hex>"`).
+    pub duotone: Option<String>,
+    /// Optional posterize level count (`2..=16`).
+    pub posterize: Option<u8>,
+    /// Optional binary luminance threshold (`0..=255`).
+    pub threshold: Option<u8>,
+    /// Optional block pixelation size (`2..=64`).
+    pub pixelate: Option<u8>,
+    /// Optional radial vignette strength (`0..=100`).
+    pub vignette: Option<u8>,
 }
 
 /// A validated named preset whose fields already uphold all domain invariants.
@@ -109,6 +119,16 @@ pub struct ValidatedPreset {
     pub sepia: Option<Sepia>,
     /// Optional monochrome tint colour.
     pub tint: Option<BackgroundColour>,
+    /// Optional duotone colour pair.
+    pub duotone: Option<Duotone>,
+    /// Optional posterize level count.
+    pub posterize: Option<Posterize>,
+    /// Optional binary threshold.
+    pub threshold: Option<u8>,
+    /// Optional pixelation block size.
+    pub pixelate: Option<Pixelate>,
+    /// Optional radial vignette strength.
+    pub vignette: Option<Vignette>,
 }
 
 /// Immutable registry of validated named presets.
@@ -292,6 +312,20 @@ fn populate_preset_filters(
         })
         .transpose()
         .map_err(wrap)?;
+    preset.duotone = cfg
+        .duotone
+        .as_deref()
+        .map(str::parse::<Duotone>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.posterize = cfg
+        .posterize
+        .map(Posterize::new)
+        .transpose()
+        .map_err(wrap)?;
+    preset.threshold = cfg.threshold;
+    preset.pixelate = cfg.pixelate.map(Pixelate::new).transpose().map_err(wrap)?;
+    preset.vignette = cfg.vignette.map(Vignette::new).transpose().map_err(wrap)?;
     Ok(())
 }
 
