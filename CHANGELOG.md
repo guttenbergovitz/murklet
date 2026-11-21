@@ -4,6 +4,15 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-21
+
+### Added
+
+- **Pure-Rust S3-compatible origin (`src/origin/s3.rs`):** Added `S3Origin` with AWS Signature Version 4 (`SigV4`) signing, custom endpoint and path-style support (AWS S3, Cloudflare R2, MinIO, RustFS, Hetzner, etc.), optional object key prefix, environment-variable credential fallback (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), and `s3://` routing across `/load`, `/metrics`, and `murklet explain`.
+- **Fit, crop, geometry, DPR, and alpha flattening (`src/domain/geometry.rs`, `src/engine/pipeline.rs`):** Added `fit` (`fill`, `contain`, `cover`, `scale-down`), `gravity` (9 anchor points plus focal point `fp:x:y`), clockwise `rotate` (`0`, `90`, `180`, `270`), `dpr` (`1.0..=3.0`), and `bg` RGB hex background flattening for alpha-bearing images encoded to JPEG.
+- **Post-resize image filters & brand monochrome tint (`src/domain/filters.rs`, `src/engine/pipeline.rs`):** Added a fixed canonical post-resize filter pipeline supporting `flip` (`h`/`v`/`hv`), `brightness` (`-100..=100`), `contrast` (`-100..=100`), `saturation` (`-100..=100`), `hue` (`-360..=360`), `gamma` (`0.2..=5.0` via 256-byte LUT), `grayscale`/`greyscale`, `sepia` (`0..=100` or `true`/`false`), brand monochrome duotone `tint`/`mono`/`monochrome` (RGB hex `black -> base colour -> white` ramp preserving alpha), `invert`/`negative`, `blur` (`0.5..=20.0`), and `sharpen` (`0.5..=10.0`), all wired into `[presets.*]` and `murklet explain`.
+- **Cache TTL & disk-budget eviction (`src/cache/fs.rs`, `src/policy/config.rs`, `src/main.rs`):** Added optional `cache.max_total_bytes`, `cache.ttl_secs`, and `cache.sweep_interval_secs` with lazy TTL expiry on reads, oldest-`mtime` eviction sweeps ignoring in-flight temp files, empty shard pruning, and a graceful background sweeper task.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added
