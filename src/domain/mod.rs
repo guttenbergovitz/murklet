@@ -7,6 +7,7 @@ pub mod error;
 pub mod filters;
 pub mod geometry;
 pub mod transform;
+pub mod watermark;
 
 pub use error::{Axis, DomainError};
 pub use filters::{
@@ -20,3 +21,4 @@ pub use transform::{
     CANONICAL_SPEC_VERSION, DEFAULT_MAX_DIMENSION, Dimension, ImageDimensions, OutputFormat,
     Quality, ResizeFilter, SelectedFilter, TargetDimensions, TransformSpec,
 };
+pub use watermark::{WatermarkOpacity, WatermarkScale, WatermarkSpec, is_valid_watermark_name};

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use murklet::cache::FsCache;
+use murklet::engine::WatermarkRegistry;
 use murklet::http::{AppState, build_router, explain_load_request};
 use murklet::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 use murklet::policy::{LogFormatConfig, MurkletConfig};
@@ -48,12 +49,13 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         CliCommand::Check { config_path } => {
             let config = MurkletConfig::from_file(&config_path)?;
             println!(
-                "configuration valid: {} (bind={}, local_origin={}, http_origin={}, presets={})",
+                "configuration valid: {} (bind={}, local_origin={}, http_origin={}, presets={}, watermarks={})",
                 config_path.display(),
                 config.server.bind,
                 config.origins.local.enabled,
                 config.origins.http.enabled,
                 config.presets.len(),
+                config.watermarks.len(),
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -154,6 +156,8 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let request_signer = config.request_signer()?;
     let presets = config.preset_registry()?;
+    let engine_limits = config.engine_limits();
+    let watermarks = WatermarkRegistry::load_from_paths(&config.watermarks, &engine_limits)?;
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
         .with_max_concurrent_transforms(config.limits.max_concurrent_transforms);
@@ -163,7 +167,7 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
     if let Some(sc) = source_cache {
         state = state.with_source_cache(sc);
     }
-    state.engine_limits = config.engine_limits();
+    state.engine_limits = engine_limits;
     state.max_target_dimension = config.limits.max_target_dimension;
     state.transform_queue_timeout = Duration::from_secs(config.limits.transform_queue_timeout_secs);
     state.cache_control = config.server.cache_control;
@@ -172,6 +176,7 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
     state.cleanup_token = config.server.cleanup_token;
     state.request_signer = request_signer;
     state.presets = presets;
+    state.watermarks = watermarks;
     state.diagnostic_headers = config.server.diagnostic_headers;
 
     let app = build_router(Arc::new(state));
@@ -183,6 +188,7 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
         s3_origin = config.origins.s3.enabled,
         metrics_enabled = config.server.metrics_enabled,
         presets = config.presets.len(),
+        watermarks = config.watermarks.len(),
         "murklet server listening"
     );
 

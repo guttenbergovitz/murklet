@@ -92,6 +92,12 @@ pub enum DomainError {
     InvalidPixelate(u8),
     /// Requested vignette strength is outside `0..=100`.
     InvalidVignette(u8),
+    /// Requested watermark name is empty or contains illegal characters.
+    InvalidWatermarkName(String),
+    /// Requested watermark opacity is outside `1..=100`.
+    InvalidWatermarkOpacity(u8),
+    /// Requested watermark scale is outside `5..=100`.
+    InvalidWatermarkScale(u8),
 }
 
 impl fmt::Display for DomainError {
@@ -174,6 +180,18 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidVignette(val) => {
                 write!(f, "vignette strength must be between 0 and 100, got {val}")
+            }
+            Self::InvalidWatermarkName(name) => {
+                write!(
+                    f,
+                    "watermark name '{name}' must be non-empty ASCII letters, digits, '-' or '_'"
+                )
+            }
+            Self::InvalidWatermarkOpacity(val) => {
+                write!(f, "watermark opacity must be between 1 and 100, got {val}")
+            }
+            Self::InvalidWatermarkScale(val) => {
+                write!(f, "watermark scale must be between 5 and 100, got {val}")
             }
         }
     }

@@ -20,7 +20,7 @@ use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag, source_digest_hex
 use crate::domain::{
     DEFAULT_MAX_DIMENSION, ImageDimensions, OutputFormat, SelectedFilter, TransformSpec,
 };
-use crate::engine::{self, EngineLimits};
+use crate::engine::{self, EngineLimits, WatermarkRegistry};
 use crate::http::error::HttpError;
 use crate::http::metrics::{
     CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
@@ -82,6 +82,8 @@ pub struct AppState {
     pub request_signer: Option<RequestSigner>,
     /// Validated named transformation presets (`[presets.<name>]`).
     pub presets: PresetRegistry,
+    /// Pre-decoded policy-controlled watermarks (`[watermarks]`).
+    pub watermarks: WatermarkRegistry,
     /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
     pub accept_negotiation: bool,
     /// When `true`, exposes Prometheus metrics at `GET /metrics`.
@@ -115,6 +117,7 @@ impl AppState {
             cleanup_token: None,
             request_signer: None,
             presets: PresetRegistry::empty(),
+            watermarks: WatermarkRegistry::empty(),
             accept_negotiation: false,
             metrics_enabled: true,
             diagnostic_headers: false,
@@ -136,6 +139,13 @@ impl AppState {
     #[must_use]
     pub fn with_source_cache(mut self, source_cache: FsCache) -> Self {
         self.source_cache = Some(source_cache);
+        self
+    }
+
+    /// Attaches pre-decoded policy-controlled watermarks (`[watermarks]`).
+    #[must_use]
+    pub fn with_watermarks(mut self, watermarks: WatermarkRegistry) -> Self {
+        self.watermarks = watermarks;
         self
     }
 
@@ -234,6 +244,14 @@ async fn handle_load_inner(
 
     let mut parsed =
         parse_load_query_with_presets(raw_query, state.max_target_dimension, &state.presets)?;
+    if let Some(ref wm) = parsed.spec.watermark
+        && !state.watermarks.contains(&wm.name)
+    {
+        return Err(HttpError::BadRequest(format!(
+            "unknown watermark '{}'",
+            wm.name
+        )));
+    }
     let vary_accept = state.accept_negotiation && !parsed.explicit_format;
     if vary_accept {
         let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
@@ -282,12 +300,13 @@ async fn handle_load_inner(
     }
 
     // Cache miss: coalesce concurrent requests for the same canonical variant key.
+    let requested_quality = parsed.spec.quality.get();
     let coalesced = state
         .coalescer
         .execute(cache_key.clone(), || {
             let state = Arc::clone(state);
             let source = parsed.source.clone();
-            let spec = parsed.spec;
+            let spec = parsed.spec.clone();
             let key = cache_key.clone();
             async move {
                 fetch_transform_and_cache(state, origin_id, origin_kind, source, spec, key).await
@@ -299,7 +318,7 @@ async fn handle_load_inner(
     let response = build_miss_response(
         state,
         &outcome,
-        parsed.spec.quality.get(),
+        requested_quality,
         if_none_match.as_deref(),
         coalesced.was_coalesced,
         vary_accept,
@@ -436,7 +455,16 @@ async fn fetch_transform_and_cache(
 
     let metrics = Arc::clone(&state.metrics);
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
-        let output = engine::transform(&source_bytes, &spec, &state.engine_limits)?;
+        let watermark = spec
+            .watermark
+            .as_ref()
+            .and_then(|wm| state.watermarks.get(&wm.name));
+        let output = engine::transform_with_watermark(
+            &source_bytes,
+            &spec,
+            &state.engine_limits,
+            watermark.as_deref(),
+        )?;
 
         // Store transformed bytes under a key matching the actual output format
         // (relevant if an animated source was passed through in its original format).
@@ -1329,5 +1357,49 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get("retry-after").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn load_composites_declared_watermark_and_rejects_unknown_name() {
+        let fixture = TestFixture::new("watermarks");
+        let mut watermarks = WatermarkRegistry::empty();
+        watermarks
+            .insert(
+                "brand",
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 255, 255, 255])),
+            )
+            .unwrap();
+
+        let state = fixture.state().with_watermarks(watermarks);
+        let app = build_router(Arc::new(state));
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&f=png&wm=brand&wm_pos=center&wm_opacity=100&wm_scale=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let bytes = ok.into_body().collect().await.unwrap().to_bytes();
+        let decoded = image::load_from_memory(&bytes).unwrap().into_rgb8();
+        // Sample image is red/blue/etc., while centred 100% opaque white watermark makes centre white.
+        let (cx, cy) = (decoded.width() / 2, decoded.height() / 2);
+        assert_eq!(decoded.get_pixel(cx, cy).0, [255, 255, 255]);
+
+        // Undeclared watermark is rejected with 400 Bad Request before touching origins/cache.
+        let bad = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&wm=does_not_exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 }

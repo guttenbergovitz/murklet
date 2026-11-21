@@ -66,7 +66,7 @@ impl fmt::Display for ExplainReport {
                 writeln!(f, "Preset:    {}", preset.as_deref().unwrap_or("none"))?;
                 writeln!(
                     f,
-                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={} filters={}",
+                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={} filters={} watermark={}",
                     spec.format,
                     spec.quality.get(),
                     spec.dimensions
@@ -85,6 +85,9 @@ impl fmt::Display for ExplainReport {
                         crate::domain::BackgroundColour::to_hex
                     ),
                     spec.filters,
+                    spec.watermark
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), ToString::to_string),
                 )?;
                 writeln!(f, "Canonical: {}", spec.canonical_representation())?;
                 writeln!(
@@ -155,6 +158,14 @@ pub fn explain_load_request(
     let vary_accept = config.server.accept_negotiation && !parsed.explicit_format;
     if vary_accept {
         parsed.spec.format = negotiate_format(accept_header);
+    }
+
+    if let Some(ref wm) = parsed.spec.watermark
+        && !config.watermarks.contains_key(&wm.name)
+    {
+        return ExplainReport::Denied {
+            reason: format!("unknown watermark '{}'", wm.name),
+        };
     }
 
     let origin = match classify_and_validate_origin(config, &parsed.source) {
@@ -260,6 +271,10 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "threshold" => out.threshold = Some(value.into_owned()),
             "pixelate" => out.pixelate = Some(value.into_owned()),
             "vignette" => out.vignette = Some(value.into_owned()),
+            "wm" | "watermark" => out.wm = Some(value.into_owned()),
+            "wm_pos" => out.wm_pos = Some(value.into_owned()),
+            "wm_opacity" => out.wm_opacity = Some(value.into_owned()),
+            "wm_scale" => out.wm_scale = Some(value.into_owned()),
             _ => {}
         }
     }
@@ -353,5 +368,29 @@ allowed_hosts = ["cdn.example.com"]
             !explain_load_request(&cfg, "/load?url=sample.png&preset=missing", None).is_allowed()
         );
         assert!(!explain_load_request(&cfg, "/load?url=../secret.png", None).is_allowed());
+    }
+
+    #[test]
+    fn explains_declared_and_unknown_watermarks() {
+        let cfg = MurkletConfig::from_toml_str(
+            r#"
+[watermarks]
+brand = "./assets/logo.png"
+"#,
+        )
+        .unwrap();
+
+        let allowed = explain_load_request(
+            &cfg,
+            "/load?url=photo.jpg&wm=brand&wm_pos=south-east&wm_opacity=60&wm_scale=25",
+            None,
+        );
+        assert!(allowed.is_allowed());
+        let rendered = allowed.to_string();
+        assert!(rendered.contains("watermark=brand@se(60%,25%)"));
+        assert!(rendered.contains("|wm=brand:se:60:25"));
+
+        let denied = explain_load_request(&cfg, "/load?url=photo.jpg&wm=missing", None);
+        assert!(!denied.is_allowed());
     }
 }

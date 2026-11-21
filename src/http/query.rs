@@ -6,7 +6,7 @@ use crate::domain::{
     Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, Duotone,
     FitMode, Flip, Gamma, Gravity, Hue, ImageFilters, OutputFormat, Pixelate, Posterize, Quality,
     ResizeFilter, Rotation, Saturation, Sepia, SharpenSigma, TargetDimensions, TransformSpec,
-    Vignette,
+    Vignette, WatermarkOpacity, WatermarkScale, WatermarkSpec,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -75,6 +75,15 @@ pub struct RawLoadQuery {
     pub pixelate: Option<String>,
     /// Optional radial vignette strength (`0..=100`).
     pub vignette: Option<String>,
+    /// Optional logical watermark name declared in `[watermarks]`.
+    #[serde(alias = "watermark")]
+    pub wm: Option<String>,
+    /// Optional watermark anchor position (`south-east`, `center`, `fp:0.5:0.5`, etc.).
+    pub wm_pos: Option<String>,
+    /// Optional watermark opacity percentage (`1..=100`, default `50`).
+    pub wm_opacity: Option<String>,
+    /// Optional watermark width scale percentage (`5..=100`, default `20`).
+    pub wm_scale: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -115,19 +124,20 @@ pub fn parse_load_query_with_presets(
     max_dimension: u32,
     presets: &PresetRegistry,
 ) -> Result<ParsedLoadRequest, HttpError> {
-    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
+    let default_preset = ValidatedPreset::default();
+    let (preset_name, preset_defaults): (Option<String>, &ValidatedPreset) =
         match raw.preset.as_deref().filter(|value| !value.is_empty()) {
-            None => (None, ValidatedPreset::default()),
+            None => (None, &default_preset),
             Some(name) => {
                 let found = presets
                     .get(name)
-                    .copied()
                     .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
                 (Some(name.to_owned()), found)
             }
         };
 
-    let filters = parse_image_filters(&raw, &preset_defaults)?;
+    let filters = parse_image_filters(&raw, preset_defaults)?;
+    let watermark = parse_watermark(&raw, preset_defaults)?;
 
     let source = raw
         .url
@@ -212,9 +222,38 @@ pub fn parse_load_query_with_presets(
             rotation,
             background,
             filters,
+            watermark,
         },
         explicit_format,
     })
+}
+
+fn parse_watermark(
+    raw: &RawLoadQuery,
+    preset: &ValidatedPreset,
+) -> Result<Option<WatermarkSpec>, HttpError> {
+    let position = match raw.wm_pos.as_deref() {
+        None | Some("") => preset.wm_pos.unwrap_or(Gravity::SouthEast),
+        Some(value) => value.parse::<Gravity>()?,
+    };
+    let opacity = match raw.wm_opacity.as_deref() {
+        None | Some("") => preset.wm_opacity.unwrap_or_default(),
+        Some(value) => WatermarkOpacity::new(parse_u8_param("wm_opacity", value, 1, 100)?)?,
+    };
+    let scale = match raw.wm_scale.as_deref() {
+        None | Some("") => preset.wm_scale.unwrap_or_default(),
+        Some(value) => WatermarkScale::new(parse_u8_param("wm_scale", value, 5, 100)?)?,
+    };
+
+    let wm_name = match raw.wm.as_deref().filter(|v| !v.is_empty()) {
+        Some(name) => Some(name),
+        None => preset.watermark.as_deref(),
+    };
+
+    wm_name
+        .map(|name| WatermarkSpec::new(name, position, opacity, scale))
+        .transpose()
+        .map_err(HttpError::from)
 }
 
 fn parse_image_filters(
@@ -458,6 +497,66 @@ mod tests {
             RawLoadQuery {
                 url: Some("a.png".to_owned()),
                 filter: Some("magic".to_owned()),
+                ..RawLoadQuery::default()
+            },
+        ] {
+            assert!(matches!(
+                parse_load_query(bad, DEFAULT_MAX_DIMENSION),
+                Err(HttpError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_watermark_query_parameters_and_preset_overrides() {
+        let mut raw_presets = std::collections::BTreeMap::new();
+        raw_presets.insert(
+            "branded".to_owned(),
+            crate::policy::PresetConfig {
+                watermark: Some("brand".to_owned()),
+                wm_pos: Some("south-east".to_owned()),
+                wm_opacity: Some(40),
+                wm_scale: Some(25),
+                ..crate::policy::PresetConfig::default()
+            },
+        );
+        let presets = PresetRegistry::from_config(&raw_presets, DEFAULT_MAX_DIMENSION).unwrap();
+
+        let from_preset = parse_load_query_with_presets(
+            RawLoadQuery {
+                url: Some("hero.jpg".to_owned()),
+                preset: Some("branded".to_owned()),
+                wm_pos: Some("center".to_owned()),
+                ..RawLoadQuery::default()
+            },
+            DEFAULT_MAX_DIMENSION,
+            &presets,
+        )
+        .unwrap();
+
+        let wm = from_preset.spec.watermark.unwrap();
+        assert_eq!(wm.name, "brand");
+        assert_eq!(wm.position, Gravity::Center);
+        assert_eq!(wm.opacity.get(), 40);
+        assert_eq!(wm.scale.get(), 25);
+
+        // Invalid watermark opacity / scale / name rejected.
+        for bad in [
+            RawLoadQuery {
+                url: Some("a.png".to_owned()),
+                wm: Some("../evil".to_owned()),
+                ..RawLoadQuery::default()
+            },
+            RawLoadQuery {
+                url: Some("a.png".to_owned()),
+                wm: Some("brand".to_owned()),
+                wm_opacity: Some("0".to_owned()),
+                ..RawLoadQuery::default()
+            },
+            RawLoadQuery {
+                url: Some("a.png".to_owned()),
+                wm: Some("brand".to_owned()),
+                wm_scale: Some("4".to_owned()),
                 ..RawLoadQuery::default()
             },
         ] {

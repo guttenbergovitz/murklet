@@ -22,6 +22,7 @@ use crate::domain::{
 };
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
+use crate::engine::watermark::apply_watermark;
 
 /// Default `rav1e` speed preset (`1..=10`; higher is faster) tuned for on-demand HTTP delivery.
 const DEFAULT_AVIF_SPEED: u8 = 8;
@@ -56,6 +57,23 @@ pub fn transform(
     input: &[u8],
     spec: &TransformSpec,
     limits: &EngineLimits,
+) -> Result<TransformOutput, EngineError> {
+    transform_with_watermark(input, spec, limits, None)
+}
+
+/// Validates, decodes, transforms, optionally composites a policy-declared watermark,
+/// and encodes raw image bytes using a pure-Rust pipeline.
+///
+/// # Errors
+///
+/// Returns an [`EngineError`] if input limits are exceeded, the format is unsupported,
+/// a watermark is requested in `spec` without a matching decoded image, or
+/// decoding/encoding fails.
+pub fn transform_with_watermark(
+    input: &[u8],
+    spec: &TransformSpec,
+    limits: &EngineLimits,
+    watermark: Option<&RgbaImage>,
 ) -> Result<TransformOutput, EngineError> {
     if input.len() > limits.max_input_bytes {
         return Err(EngineError::InputTooLarge {
@@ -106,7 +124,12 @@ pub fn transform(
         resize_image(cropped, plan.output, filter.filter)?
     };
 
-    let processed = apply_pixel_filters(resized, &spec.filters);
+    let filtered = apply_pixel_filters(resized, &spec.filters);
+    let processed = match (&spec.watermark, watermark) {
+        (Some(wm_spec), Some(wm_image)) => apply_watermark(filtered, wm_image, wm_spec)?,
+        (Some(wm_spec), None) => return Err(EngineError::UnknownWatermark(wm_spec.name.clone())),
+        (None, _) => filtered,
+    };
     let bytes = encode_image(processed, spec)?;
 
     Ok(TransformOutput {
@@ -125,7 +148,7 @@ pub fn transform(
 /// limit errors (`SourceDimensionLimitExceeded`, `DecodedPixelLimitExceeded`)
 /// before [`decode_with_orientation`] applies decoder-level [`Limits`] as
 /// defence-in-depth.
-fn inspect_header(
+pub(crate) fn inspect_header(
     input: &[u8],
     limits: &EngineLimits,
 ) -> Result<(ImageFormat, ImageDimensions), EngineError> {
@@ -163,7 +186,7 @@ fn inspect_header(
 }
 
 /// Decodes a static image (or the first frame of an animated image) and applies EXIF orientation.
-fn decode_with_orientation(
+pub(crate) fn decode_with_orientation(
     input: &[u8],
     format: ImageFormat,
     limits: &EngineLimits,
@@ -268,7 +291,7 @@ fn resize_image(
 }
 
 /// Maps Murklet's domain [`ResizeFilter`] onto `fast_image_resize`'s SIMD resampling kernels.
-const fn map_resize_alg(filter: ResizeFilter) -> ResizeAlg {
+pub(crate) const fn map_resize_alg(filter: ResizeFilter) -> ResizeAlg {
     match filter {
         ResizeFilter::Nearest => ResizeAlg::Nearest,
         ResizeFilter::Box => ResizeAlg::Convolution(FirFilterType::Box),
