@@ -1,7 +1,7 @@
 //! Axum router and HTTP handlers wiring domain, origins, engine, and cache layers.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
-use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag};
+use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag, source_digest_hex};
 use crate::domain::{
     DEFAULT_MAX_DIMENSION, ImageDimensions, OutputFormat, SelectedFilter, TransformSpec,
 };
@@ -29,7 +29,10 @@ use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
-use crate::policy::{DEFAULT_MAX_CONCURRENT_TRANSFORMS, PresetRegistry, RequestSigner};
+use crate::policy::{
+    DEFAULT_MAX_CONCURRENT_TRANSFORMS, DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, PresetRegistry,
+    RequestSigner,
+};
 
 const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
@@ -49,6 +52,7 @@ struct MissOutcome {
 }
 
 type VariantCoalescer = Coalescer<CacheKey, Result<Arc<MissOutcome>, HttpError>>;
+type SourceCoalescer = Coalescer<String, Result<Bytes, HttpError>>;
 
 /// Shared immutable application state injected into HTTP handlers.
 #[derive(Debug, Clone)]
@@ -61,10 +65,14 @@ pub struct AppState {
     pub s3_origin: Option<S3Origin>,
     /// Filesystem-backed variant cache.
     pub cache: FsCache,
+    /// Optional filesystem-backed raw-source cache for remote HTTP(S) and S3 origins.
+    pub source_cache: Option<FsCache>,
     /// Resource limits and animation fallback policy for the image engine.
     pub engine_limits: EngineLimits,
     /// Maximum target width or height accepted in query parameters.
     pub max_target_dimension: u32,
+    /// Maximum duration a request waits for a transform concurrency slot before returning `503`.
+    pub transform_queue_timeout: Duration,
     /// `Cache-Control` header value emitted on image responses.
     pub cache_control: String,
     /// Optional secret token required by `POST /cache/cleanup`.
@@ -81,6 +89,7 @@ pub struct AppState {
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
+    source_coalescer: SourceCoalescer,
     transform_permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
 }
@@ -98,8 +107,10 @@ impl AppState {
             http_origin,
             s3_origin: None,
             cache,
+            source_cache: None,
             engine_limits: EngineLimits::default(),
             max_target_dimension: DEFAULT_MAX_DIMENSION,
+            transform_queue_timeout: Duration::from_secs(DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS),
             cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
             cleanup_token: None,
             request_signer: None,
@@ -108,6 +119,7 @@ impl AppState {
             metrics_enabled: true,
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
+            source_coalescer: Coalescer::new(),
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
             metrics: Arc::new(Metrics::new()),
         }
@@ -117,6 +129,13 @@ impl AppState {
     #[must_use]
     pub fn with_s3_origin(mut self, s3_origin: S3Origin) -> Self {
         self.s3_origin = Some(s3_origin);
+        self
+    }
+
+    /// Attaches an optional raw-source [`FsCache`] for remote HTTP(S) and S3 origins.
+    #[must_use]
+    pub fn with_source_cache(mut self, source_cache: FsCache) -> Self {
+        self.source_cache = Some(source_cache);
         self
     }
 
@@ -399,43 +418,25 @@ async fn fetch_transform_and_cache(
     key: CacheKey,
 ) -> Result<Arc<MissOutcome>, HttpError> {
     let started = Instant::now();
-    let fetched = match origin_kind {
-        OriginKind::Http => {
-            let http_origin = state.http_origin.as_ref().ok_or_else(|| {
-                HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
-            })?;
-            http_origin.fetch(&source).await?
-        }
-        OriginKind::S3 => {
-            let s3_origin = state
-                .s3_origin
-                .as_ref()
-                .ok_or_else(|| HttpError::Forbidden("S3 origin is disabled".to_owned()))?;
-            s3_origin.fetch(&source).await?
-        }
-        OriginKind::Local => {
-            let local_origin = state.local_origin.clone().ok_or_else(|| {
-                HttpError::Forbidden("local filesystem origin is disabled".to_owned())
-            })?;
-            let source_for_fs = source.clone();
-            tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
-                .await
-                .map_err(|_| HttpError::Internal)??
-        }
-    };
+    let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source).await?;
+    let original_size = source_bytes.len();
 
-    let original_size = fetched.bytes.len();
-
-    // Bound concurrent CPU/memory-intensive image decoding and encoding.
-    let _permit = Arc::clone(&state.transform_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| HttpError::Internal)?;
+    // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
+    // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
+    let _permit = tokio::time::timeout(
+        state.transform_queue_timeout,
+        Arc::clone(&state.transform_permits).acquire_owned(),
+    )
+    .await
+    .map_err(|_| HttpError::ServiceUnavailable {
+        retry_after_secs: 2,
+    })?
+    .map_err(|_| HttpError::Internal)?;
     let _in_flight = state.metrics.track_in_flight();
 
     let metrics = Arc::clone(&state.metrics);
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
-        let output = engine::transform(&fetched.bytes, &spec, &state.engine_limits)?;
+        let output = engine::transform(&source_bytes, &spec, &state.engine_limits)?;
 
         // Store transformed bytes under a key matching the actual output format
         // (relevant if an animated source was passed through in its original format).
@@ -466,6 +467,75 @@ async fn fetch_transform_and_cache(
     })
     .await
     .map_err(|_| HttpError::Internal)?
+}
+
+/// Fetches raw source bytes, coalescing concurrent remote fetches and consulting
+/// the optional disk-backed `source_cache` for HTTP(S) and S3 origins.
+async fn fetch_source_bytes(
+    state: &Arc<AppState>,
+    origin_id: &'static str,
+    origin_kind: OriginKind,
+    source: &str,
+) -> Result<Bytes, HttpError> {
+    if origin_kind == OriginKind::Local {
+        let local_origin = state.local_origin.clone().ok_or_else(|| {
+            HttpError::Forbidden("local filesystem origin is disabled".to_owned())
+        })?;
+        let source_for_fs = source.to_owned();
+        let fetched = tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
+            .await
+            .map_err(|_| HttpError::Internal)??;
+        return Ok(Bytes::from(fetched.bytes));
+    }
+
+    let digest = source_digest_hex(origin_id, source);
+
+    if let Some(source_cache) = state.source_cache.clone() {
+        let digest_for_get = digest.clone();
+        if let Ok(Ok(Some(cached))) =
+            tokio::task::spawn_blocking(move || source_cache.get_raw(&digest_for_get)).await
+        {
+            return Ok(Bytes::from(cached));
+        }
+    }
+
+    let coalesced = state
+        .source_coalescer
+        .execute(digest.clone(), || {
+            let state = Arc::clone(state);
+            let source_owned = source.to_owned();
+            let digest_for_put = digest.clone();
+            async move {
+                let fetched = match origin_kind {
+                    OriginKind::Http => {
+                        let http_origin = state.http_origin.as_ref().ok_or_else(|| {
+                            HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
+                        })?;
+                        http_origin.fetch(&source_owned).await?
+                    }
+                    OriginKind::S3 => {
+                        let s3_origin = state.s3_origin.as_ref().ok_or_else(|| {
+                            HttpError::Forbidden("S3 origin is disabled".to_owned())
+                        })?;
+                        s3_origin.fetch(&source_owned).await?
+                    }
+                    OriginKind::Local => return Err(HttpError::Internal),
+                };
+
+                let bytes = Bytes::from(fetched.bytes);
+                if let Some(source_cache) = state.source_cache.clone() {
+                    let bytes_for_put = bytes.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = source_cache.put_raw(&digest_for_put, &bytes_for_put);
+                    })
+                    .await;
+                }
+                Ok(bytes)
+            }
+        })
+        .await;
+
+    coalesced.value
 }
 
 fn is_http_source(source: &str) -> bool {
@@ -515,9 +585,16 @@ async fn cleanup_handler(
     }
 
     let cache = state.cache.clone();
-    let removed = tokio::task::spawn_blocking(move || cache.cleanup())
-        .await
-        .map_err(|_| HttpError::Internal)??;
+    let source_cache = state.source_cache.clone();
+    let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
+        let mut count = cache.cleanup()?;
+        if let Some(src_cache) = source_cache {
+            count += src_cache.cleanup()?;
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|_| HttpError::Internal)??;
 
     state.metrics.record_cache_cleanup();
     tracing::info!(removed_files = removed, "cache cleanup completed");
@@ -1225,5 +1302,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn saturated_transform_queue_returns_503_with_retry_after() {
+        let fixture = TestFixture::new("backpressure");
+        let mut state = fixture.state().with_max_concurrent_transforms(1);
+        state.transform_queue_timeout = Duration::from_millis(25);
+
+        // Hold the sole transform permit so incoming requests time out cleanly.
+        let _held_permit = Arc::clone(&state.transform_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let app = build_router(Arc::new(state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "2");
     }
 }

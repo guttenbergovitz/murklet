@@ -54,6 +54,17 @@ impl CacheKey {
     }
 }
 
+/// Computes a canonical 64-character lowercase hexadecimal BLAKE3 digest for a
+/// raw upstream source asset identified by `(origin_id, source_key)`.
+#[must_use]
+pub fn source_digest_hex(origin_id: &str, source_key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    update_length_prefixed(&mut hasher, b"src:v1");
+    update_length_prefixed(&mut hasher, origin_id.as_bytes());
+    update_length_prefixed(&mut hasher, source_key.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Computes a strong quoted HTTP `ETag` from the BLAKE3 digest of encoded variant bytes.
 #[must_use]
 pub fn compute_etag(bytes: &[u8]) -> String {
