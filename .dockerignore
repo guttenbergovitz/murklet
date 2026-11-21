@@ -1,0 +1,7 @@
+/target/
+/cache/
+/.cache/
+/.git/
+/.specs/
+.DS_Store
+*.swp
