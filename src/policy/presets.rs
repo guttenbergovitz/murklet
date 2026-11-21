@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
-    Flip, Gamma, Gravity, Hue, OutputFormat, Quality, ResizeFilter, Rotation, Saturation, Sepia,
-    SharpenSigma,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, Duotone,
+    FitMode, Flip, Gamma, Gravity, Hue, OutputFormat, Pixelate, Posterize, Quality, ResizeFilter,
+    Rotation, Saturation, Sepia, SharpenSigma, Vignette, WatermarkOpacity, WatermarkScale,
+    is_valid_watermark_name,
 };
 use crate::policy::error::PolicyError;
 
@@ -60,10 +61,29 @@ pub struct PresetConfig {
     /// Optional RGB hex brand monochrome tint colour (for example `"1a73e8"`).
     #[serde(alias = "mono", alias = "monochrome")]
     pub tint: Option<String>,
+    /// Optional duotone colour pair (`"<dark_hex>:<light_hex>"`).
+    pub duotone: Option<String>,
+    /// Optional posterize level count (`2..=16`).
+    pub posterize: Option<u8>,
+    /// Optional binary luminance threshold (`0..=255`).
+    pub threshold: Option<u8>,
+    /// Optional block pixelation size (`2..=64`).
+    pub pixelate: Option<u8>,
+    /// Optional radial vignette strength (`0..=100`).
+    pub vignette: Option<u8>,
+    /// Optional logical watermark name declared in `[watermarks]`.
+    #[serde(alias = "wm")]
+    pub watermark: Option<String>,
+    /// Optional watermark anchor position (`south-east`, `center`, `fp:0.5:0.5`, etc.).
+    pub wm_pos: Option<String>,
+    /// Optional watermark opacity percentage (`1..=100`).
+    pub wm_opacity: Option<u8>,
+    /// Optional watermark width scale percentage (`5..=100`).
+    pub wm_scale: Option<u8>,
 }
 
 /// A validated named preset whose fields already uphold all domain invariants.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidatedPreset {
     /// Optional target width (pre-DPR).
     pub width: Option<Dimension>,
@@ -109,6 +129,24 @@ pub struct ValidatedPreset {
     pub sepia: Option<Sepia>,
     /// Optional monochrome tint colour.
     pub tint: Option<BackgroundColour>,
+    /// Optional duotone colour pair.
+    pub duotone: Option<Duotone>,
+    /// Optional posterize level count.
+    pub posterize: Option<Posterize>,
+    /// Optional binary threshold.
+    pub threshold: Option<u8>,
+    /// Optional pixelation block size.
+    pub pixelate: Option<Pixelate>,
+    /// Optional radial vignette strength.
+    pub vignette: Option<Vignette>,
+    /// Optional logical watermark name.
+    pub watermark: Option<String>,
+    /// Optional watermark anchor position.
+    pub wm_pos: Option<Gravity>,
+    /// Optional watermark opacity percentage.
+    pub wm_opacity: Option<WatermarkOpacity>,
+    /// Optional watermark width scale percentage.
+    pub wm_scale: Option<WatermarkScale>,
 }
 
 /// Immutable registry of validated named presets.
@@ -290,6 +328,42 @@ fn populate_preset_filters(
             raw.parse::<BackgroundColour>()
                 .map_err(|_| DomainError::InvalidTint(raw.to_owned()))
         })
+        .transpose()
+        .map_err(wrap)?;
+    preset.duotone = cfg
+        .duotone
+        .as_deref()
+        .map(str::parse::<Duotone>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.posterize = cfg
+        .posterize
+        .map(Posterize::new)
+        .transpose()
+        .map_err(wrap)?;
+    preset.threshold = cfg.threshold;
+    preset.pixelate = cfg.pixelate.map(Pixelate::new).transpose().map_err(wrap)?;
+    preset.vignette = cfg.vignette.map(Vignette::new).transpose().map_err(wrap)?;
+    if let Some(ref wm_name) = cfg.watermark {
+        if !is_valid_watermark_name(wm_name) {
+            return Err(wrap(DomainError::InvalidWatermarkName(wm_name.clone())));
+        }
+        preset.watermark = Some(wm_name.clone());
+    }
+    preset.wm_pos = cfg
+        .wm_pos
+        .as_deref()
+        .map(str::parse::<Gravity>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.wm_opacity = cfg
+        .wm_opacity
+        .map(WatermarkOpacity::new)
+        .transpose()
+        .map_err(wrap)?;
+    preset.wm_scale = cfg
+        .wm_scale
+        .map(WatermarkScale::new)
         .transpose()
         .map_err(wrap)?;
     Ok(())

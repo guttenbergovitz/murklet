@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::domain::DEFAULT_MAX_DIMENSION;
+use crate::domain::{DEFAULT_MAX_DIMENSION, is_valid_watermark_name};
 use crate::engine::{
     AnimationPolicy, DEFAULT_MAX_DECODED_PIXELS, DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_SOURCE_DIMENSION, EngineLimits,
@@ -48,6 +48,9 @@ pub struct MurkletConfig {
     /// Optional named transformation presets (`[presets.<name>]`).
     #[serde(default)]
     pub presets: BTreeMap<String, PresetConfig>,
+    /// Optional named watermarks (`[watermarks]`) mapping logical names to local image file paths.
+    #[serde(default)]
+    pub watermarks: BTreeMap<String, PathBuf>,
 }
 
 /// Structured log output format (`server.log_format`).
@@ -611,9 +614,36 @@ impl MurkletConfig {
         }
 
         self.validate_origins()?;
+        self.validate_watermarks_and_presets()?;
+
+        Ok(())
+    }
+
+    fn validate_watermarks_and_presets(&self) -> Result<(), PolicyError> {
+        for (name, path) in &self.watermarks {
+            if !is_valid_watermark_name(name) {
+                return Err(PolicyError::Validation(format!(
+                    "watermark name '{name}' must be non-empty ASCII letters, digits, '-' or '_'"
+                )));
+            }
+            if path.as_os_str().is_empty() {
+                return Err(PolicyError::Validation(format!(
+                    "watermark '{name}' path must not be empty"
+                )));
+            }
+        }
 
         // Validate all declared named presets eagerly at startup.
         let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
+        for (preset_name, preset_cfg) in &self.presets {
+            if let Some(wm_name) = preset_cfg.watermark.as_deref()
+                && !self.watermarks.contains_key(wm_name)
+            {
+                return Err(PolicyError::Validation(format!(
+                    "preset '{preset_name}' references undeclared watermark '{wm_name}'"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -889,5 +919,42 @@ max_redirects = 3
         assert_eq!(http_cfg.timeout, Duration::from_secs(20));
         assert_eq!(http_cfg.connect_timeout, Duration::from_secs(4));
         assert_eq!(http_cfg.max_redirects, 3);
+    }
+
+    #[test]
+    fn validates_watermarks_and_preset_watermark_references() {
+        let valid = r#"
+[watermarks]
+brand = "./assets/logo.png"
+
+[presets.branded]
+width = 800
+watermark = "brand"
+wm_pos = "south-east"
+wm_opacity = 40
+wm_scale = 20
+"#;
+        let cfg = MurkletConfig::from_toml_str(valid).unwrap();
+        assert_eq!(cfg.watermarks.len(), 1);
+
+        // Preset referencing an undeclared watermark fails validation at startup.
+        let dangling = r#"
+[presets.branded]
+watermark = "missing"
+"#;
+        assert!(matches!(
+            MurkletConfig::from_toml_str(dangling),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Illegal watermark name fails validation.
+        let bad_name = r#"
+[watermarks]
+"../evil" = "./assets/logo.png"
+"#;
+        assert!(matches!(
+            MurkletConfig::from_toml_str(bad_name),
+            Err(PolicyError::Validation(_))
+        ));
     }
 }

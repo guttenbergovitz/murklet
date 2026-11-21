@@ -88,7 +88,12 @@ impl From<EngineError> for HttpError {
             EngineError::SourceDimensionLimitExceeded { .. }
             | EngineError::DecodedPixelLimitExceeded { .. }
             | EngineError::DecodeFailed(_) => Self::UnprocessableEntity(err.to_string()),
-            EngineError::EncodeFailed(_) => Self::Internal,
+            EngineError::UnknownWatermark(name) => {
+                Self::BadRequest(format!("unknown watermark '{name}'"))
+            }
+            EngineError::EncodeFailed(_) | EngineError::WatermarkLoadFailed { .. } => {
+                Self::Internal
+            }
         }
     }
 }

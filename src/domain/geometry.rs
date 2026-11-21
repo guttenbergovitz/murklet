@@ -139,10 +139,10 @@ impl FromStr for Gravity {
             "south" | "so" | "bottom" => Ok(Self::South),
             "east" | "ea" | "right" => Ok(Self::East),
             "west" | "we" | "left" => Ok(Self::West),
-            "nw" | "northwest" => Ok(Self::NorthWest),
-            "ne" | "northeast" => Ok(Self::NorthEast),
-            "sw" | "southwest" => Ok(Self::SouthWest),
-            "se" | "southeast" => Ok(Self::SouthEast),
+            "nw" | "northwest" | "north-west" | "north_west" => Ok(Self::NorthWest),
+            "ne" | "northeast" | "north-east" | "north_east" => Ok(Self::NorthEast),
+            "sw" | "southwest" | "south-west" | "south_west" => Ok(Self::SouthWest),
+            "se" | "southeast" | "south-east" | "south_east" => Ok(Self::SouthEast),
             _ => {
                 if let Some(rest) = lower.strip_prefix("fp:")
                     && let Some((x_raw, y_raw)) = rest.split_once(':')

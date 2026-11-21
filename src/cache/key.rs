@@ -99,7 +99,7 @@ mod tests {
         };
         let spec_b = TransformSpec {
             quality: Quality::new(90).unwrap(),
-            ..spec_a
+            ..spec_a.clone()
         };
 
         let key_a = CacheKey::from_parts("local", "hero.png", &spec_a);
