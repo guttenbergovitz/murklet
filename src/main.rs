@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use murklet::cache::FsCache;
 use murklet::http::{AppState, build_router, explain_load_request};
-use murklet::origin::{HttpOrigin, LocalFsOrigin};
+use murklet::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 use murklet::policy::{LogFormatConfig, MurkletConfig};
 use tracing_subscriber::EnvFilter;
 
@@ -90,12 +90,17 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
         .map(HttpOrigin::new)
         .transpose()?;
 
+    let s3_origin = config.s3_origin_config()?.map(S3Origin::new).transpose()?;
+
     let cache = FsCache::new(&config.cache.dir, config.cache.max_entry_bytes)?;
     let request_signer = config.request_signer()?;
     let presets = config.preset_registry()?;
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
         .with_max_concurrent_transforms(config.limits.max_concurrent_transforms);
+    if let Some(s3) = s3_origin {
+        state = state.with_s3_origin(s3);
+    }
     state.engine_limits = config.engine_limits();
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;

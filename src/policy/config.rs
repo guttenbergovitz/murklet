@@ -13,7 +13,9 @@ use crate::engine::{
     AnimationPolicy, DEFAULT_MAX_DECODED_PIXELS, DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_SOURCE_DIMENSION, EngineLimits,
 };
-use crate::origin::{DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig};
+use crate::origin::{
+    DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig, S3Credentials, S3OriginConfig,
+};
 use crate::policy::error::PolicyError;
 use crate::policy::presets::{PresetConfig, PresetRegistry};
 use crate::policy::signing::RequestSigner;
@@ -189,6 +191,9 @@ pub struct OriginsConfig {
     /// Remote HTTP(S) origin configuration (`[origins.http]`).
     #[serde(default)]
     pub http: HttpOriginSection,
+    /// S3-compatible object storage origin configuration (`[origins.s3]`).
+    #[serde(default)]
+    pub s3: S3OriginSection,
 }
 
 /// Local filesystem origin settings (`[origins.local]`).
@@ -241,6 +246,59 @@ impl Default for HttpOriginSection {
             timeout_secs: default_http_timeout_secs(),
             connect_timeout_secs: default_http_connect_timeout_secs(),
             max_redirects: default_max_redirects(),
+        }
+    }
+}
+
+/// S3-compatible object storage origin settings (`[origins.s3]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3OriginSection {
+    /// Whether S3-compatible object fetching is enabled (default `false`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Target bucket name.
+    #[serde(default)]
+    pub bucket: String,
+    /// Signing region (default `"us-east-1"`).
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    /// Optional custom HTTP(S) endpoint for `MinIO`, Cloudflare R2, Hetzner, etc.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Optional path-style toggle (defaults to `true` when `endpoint` is set, `false` otherwise).
+    #[serde(default)]
+    pub path_style: Option<bool>,
+    /// Optional object key prefix prepended to every `s3://` request.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Optional access key ID (falls back to `AWS_ACCESS_KEY_ID`).
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// Optional secret access key (falls back to `AWS_SECRET_ACCESS_KEY`).
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// Total upstream request timeout in seconds (default `15`).
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Upstream TCP/TLS connect timeout in seconds (default `5`).
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for S3OriginSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bucket: String::new(),
+            region: default_s3_region(),
+            endpoint: None,
+            path_style: None,
+            prefix: None,
+            access_key_id: None,
+            secret_access_key: None,
+            timeout_secs: default_http_timeout_secs(),
+            connect_timeout_secs: default_http_connect_timeout_secs(),
         }
     }
 }
@@ -322,6 +380,72 @@ impl MurkletConfig {
         PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)
     }
 
+    /// Builds an [`S3OriginConfig`] when `[origins.s3]` is enabled, resolving credentials
+    /// from config or standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::Validation`] if only one of access key ID or secret access key is set.
+    pub fn s3_origin_config(&self) -> Result<Option<S3OriginConfig>, PolicyError> {
+        if !self.origins.s3.enabled {
+            return Ok(None);
+        }
+
+        let access_key = self
+            .origins
+            .s3
+            .access_key_id
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_ACCESS_KEY_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            });
+        let secret_key = self
+            .origins
+            .s3
+            .secret_access_key
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            });
+
+        let credentials = match (access_key, secret_key) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(S3Credentials {
+                access_key_id,
+                secret_access_key,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(PolicyError::Validation(
+                    "origins.s3 requires both access_key_id and secret_access_key when signing is configured".to_owned(),
+                ));
+            }
+        };
+
+        let mut cfg = S3OriginConfig::new(
+            &self.origins.s3.bucket,
+            &self.origins.s3.region,
+            self.limits.max_input_bytes,
+        );
+        cfg.endpoint.clone_from(&self.origins.s3.endpoint);
+        cfg.path_style = self
+            .origins
+            .s3
+            .path_style
+            .unwrap_or(self.origins.s3.endpoint.is_some());
+        cfg.prefix.clone_from(&self.origins.s3.prefix);
+        cfg.credentials = credentials;
+        cfg.timeout = Duration::from_secs(self.origins.s3.timeout_secs);
+        cfg.connect_timeout = Duration::from_secs(self.origins.s3.connect_timeout_secs);
+
+        Ok(Some(cfg))
+    }
+
     /// Builds an [`HttpOriginConfig`] when `[origins.http]` is enabled, or `None` when disabled.
     #[must_use]
     pub fn http_origin_config(&self) -> Option<HttpOriginConfig> {
@@ -384,9 +508,10 @@ impl MurkletConfig {
             ));
         }
 
-        if !self.origins.local.enabled && !self.origins.http.enabled {
+        if !self.origins.local.enabled && !self.origins.http.enabled && !self.origins.s3.enabled {
             return Err(PolicyError::Validation(
-                "at least one origin (origins.local or origins.http) must be enabled".to_owned(),
+                "at least one origin (origins.local, origins.http, or origins.s3) must be enabled"
+                    .to_owned(),
             ));
         }
 
@@ -411,6 +536,29 @@ impl MurkletConfig {
             if self.origins.http.connect_timeout_secs > self.origins.http.timeout_secs {
                 return Err(PolicyError::Validation(
                     "origins.http.connect_timeout_secs must not exceed timeout_secs".to_owned(),
+                ));
+            }
+        }
+
+        if self.origins.s3.enabled {
+            if self.origins.s3.bucket.trim().is_empty() {
+                return Err(PolicyError::Validation(
+                    "origins.s3.bucket must not be empty when origins.s3 is enabled".to_owned(),
+                ));
+            }
+            if self.origins.s3.region.trim().is_empty() {
+                return Err(PolicyError::Validation(
+                    "origins.s3.region must not be empty when origins.s3 is enabled".to_owned(),
+                ));
+            }
+            if self.origins.s3.timeout_secs == 0 || self.origins.s3.connect_timeout_secs == 0 {
+                return Err(PolicyError::Validation(
+                    "origins.s3 timeouts must be greater than zero".to_owned(),
+                ));
+            }
+            if self.origins.s3.connect_timeout_secs > self.origins.s3.timeout_secs {
+                return Err(PolicyError::Validation(
+                    "origins.s3.connect_timeout_secs must not exceed timeout_secs".to_owned(),
                 ));
             }
         }
@@ -472,6 +620,10 @@ const fn default_http_connect_timeout_secs() -> u64 {
 
 const fn default_max_redirects() -> u8 {
     DEFAULT_MAX_REDIRECTS
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_owned()
 }
 
 #[cfg(test)]

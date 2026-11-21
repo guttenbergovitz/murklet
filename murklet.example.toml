@@ -40,6 +40,20 @@ timeout_secs = 15
 connect_timeout_secs = 5
 max_redirects = 5
 
+[origins.s3]
+# S3-compatible object storage (AWS S3, Cloudflare R2, MinIO, RustFS, etc.).
+enabled = false
+bucket = ""
+region = "us-east-1"
+# endpoint = "https://<account>.r2.cloudflarestorage.com"
+# path_style = true
+# prefix = "uploads/"
+# Credentials default to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY when omitted.
+# access_key_id = ""
+# secret_access_key = ""
+timeout_secs = 15
+connect_timeout_secs = 5
+
 # Optional named transformation presets referenced via `?preset=<name>`.
 # [presets.thumb]
 # width = 300
