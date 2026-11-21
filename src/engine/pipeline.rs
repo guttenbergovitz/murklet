@@ -2,16 +2,23 @@
 
 use std::io::Cursor;
 
+use image::codecs::avif::AvifEncoder;
 use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
-use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{
+    AnimationDecoder, DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFormat,
+    ImageReader, Limits,
+};
 
 use crate::domain::{ImageDimensions, OutputFormat, ResizeFilter, SelectedFilter, TransformSpec};
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
+
+/// Default `rav1e` speed preset (`1..=10`; higher is faster) tuned for on-demand HTTP delivery.
+const DEFAULT_AVIF_SPEED: u8 = 8;
 
 /// Encoded output and metadata returned by [`transform`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,10 +56,6 @@ pub fn transform(
             size: input.len(),
             max: limits.max_input_bytes,
         });
-    }
-
-    if spec.format == OutputFormat::Avif {
-        return Err(EngineError::UnsupportedOutputFormat(OutputFormat::Avif));
     }
 
     let (input_format, header_dimensions) = inspect_header(input, limits)?;
@@ -237,7 +240,20 @@ fn encode_image(image: DynamicImage, spec: &TransformSpec) -> Result<Vec<u8>, En
                 .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
         }
         OutputFormat::Avif => {
-            return Err(EngineError::UnsupportedOutputFormat(OutputFormat::Avif));
+            let rgba = image.into_rgba8();
+            let encoder = AvifEncoder::new_with_speed_quality(
+                &mut output,
+                DEFAULT_AVIF_SPEED,
+                spec.quality.get(),
+            );
+            encoder
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
+                .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
         }
     }
 
@@ -306,18 +322,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_avif_output_cleanly_in_v0_1() {
+    fn encodes_avif_with_valid_iso_bmff_container_signature() {
         let png = make_png(16, 16);
         let spec = TransformSpec {
+            dimensions: TargetDimensions::new(
+                Some(Dimension::new(Axis::Width, 8, DEFAULT_MAX_DIMENSION).unwrap()),
+                None,
+            ),
             format: OutputFormat::Avif,
-            ..TransformSpec::default()
+            quality: Quality::new(70).unwrap(),
+            filter: None,
         };
 
-        let result = transform(&png, &spec, &EngineLimits::default());
-        assert_eq!(
-            result,
-            Err(EngineError::UnsupportedOutputFormat(OutputFormat::Avif))
-        );
+        let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
+        assert_eq!(out.format, OutputFormat::Avif);
+        assert_eq!(out.output_dimensions, ImageDimensions::new(8, 8).unwrap());
+        assert!(out.bytes.len() > 16);
+        // ISO BMFF box header has `ftyp` at bytes 4..8 and `avif` brand at 8..12.
+        assert_eq!(&out.bytes[4..8], b"ftyp");
+        assert_eq!(&out.bytes[8..12], b"avif");
     }
 
     #[test]

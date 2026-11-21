@@ -2,18 +2,19 @@
 
 use crate::domain::OutputFormat;
 
-/// Selects the best supported v0.1 [`OutputFormat`] from an HTTP `Accept` header.
+/// Selects the best supported [`OutputFormat`] from an HTTP `Accept` header.
 ///
 /// Evaluates `q` quality weights (`0.0..=1.0`, defaulting to `1.0`) across the
-/// negotiable formats supported by the v0.1 encoder (`image/webp`, `image/jpeg`,
-/// `image/png`), breaking ties in favour of `Webp > Jpeg > Png`. Falls back to
-/// [`OutputFormat::Jpeg`] when no explicit match is found or the header is absent.
+/// negotiable formats supported by the encoder (`image/avif`, `image/webp`,
+/// `image/jpeg`, `image/png`), breaking ties in favour of `Avif > Webp > Jpeg > Png`.
+/// Falls back to [`OutputFormat::Jpeg`] when no explicit match is found or the header is absent.
 #[must_use]
 pub fn negotiate_format(accept_header: Option<&str>) -> OutputFormat {
     let Some(raw) = accept_header else {
         return OutputFormat::Jpeg;
     };
 
+    let mut avif_q: Option<u16> = None;
     let mut webp_q: Option<u16> = None;
     let mut jpeg_q: Option<u16> = None;
     let mut png_q: Option<u16> = None;
@@ -31,7 +32,9 @@ pub fn negotiate_format(accept_header: Option<&str>) -> OutputFormat {
             continue;
         };
 
-        if media_range.eq_ignore_ascii_case("image/webp") {
+        if media_range.eq_ignore_ascii_case("image/avif") {
+            avif_q = Some(avif_q.map_or(q, |prev| prev.max(q)));
+        } else if media_range.eq_ignore_ascii_case("image/webp") {
             webp_q = Some(webp_q.map_or(q, |prev| prev.max(q)));
         } else if media_range.eq_ignore_ascii_case("image/jpeg") {
             jpeg_q = Some(jpeg_q.map_or(q, |prev| prev.max(q)));
@@ -40,8 +43,9 @@ pub fn negotiate_format(accept_header: Option<&str>) -> OutputFormat {
         }
     }
 
-    // Compare in preference order (WebP > JPEG > PNG) so ties pick the more modern format.
+    // Compare in preference order (AVIF > WebP > JPEG > PNG) so ties pick the more modern format.
     let candidates = [
+        (OutputFormat::Avif, avif_q.unwrap_or(0)),
         (OutputFormat::Webp, webp_q.unwrap_or(0)),
         (OutputFormat::Jpeg, jpeg_q.unwrap_or(0)),
         (OutputFormat::Png, png_q.unwrap_or(0)),
@@ -104,12 +108,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_webp_for_standard_browser_accept_headers() {
+    fn prefers_avif_then_webp_for_standard_browser_accept_headers() {
         let chrome = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
-        assert_eq!(negotiate_format(Some(chrome)), OutputFormat::Webp);
+        assert_eq!(negotiate_format(Some(chrome)), OutputFormat::Avif);
 
-        let firefox = "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
-        assert_eq!(negotiate_format(Some(firefox)), OutputFormat::Webp);
+        let webp_only = "image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
+        assert_eq!(negotiate_format(Some(webp_only)), OutputFormat::Webp);
     }
 
     #[test]
@@ -119,7 +123,7 @@ mod tests {
             OutputFormat::Jpeg
         );
         assert_eq!(
-            negotiate_format(Some("image/webp;q=0, image/png;q=0.8")),
+            negotiate_format(Some("image/avif;q=0, image/webp;q=0, image/png;q=0.8")),
             OutputFormat::Png
         );
         assert_eq!(
@@ -132,7 +136,7 @@ mod tests {
     fn falls_back_to_jpeg_for_missing_wildcard_or_unrecognised_headers() {
         assert_eq!(negotiate_format(None), OutputFormat::Jpeg);
         assert_eq!(negotiate_format(Some("*/*")), OutputFormat::Jpeg);
-        assert_eq!(negotiate_format(Some("image/avif")), OutputFormat::Jpeg);
+        assert_eq!(negotiate_format(Some("image/heic")), OutputFormat::Jpeg);
         assert_eq!(
             negotiate_format(Some("image/webp;q=invalid, image/png")),
             OutputFormat::Png

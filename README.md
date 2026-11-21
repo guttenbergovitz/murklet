@@ -130,7 +130,20 @@ Murklet is not a digital asset manager, browser image editor, image generation s
 
 ## Quickstart
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.85+ (edition 2024). If you have [Task](https://taskfile.dev/) installed, common development workflows are available in [Taskfile.yml](Taskfile.yml):
+
+```bash
+# Run the full CI gate (format, Clippy, tests)
+task check
+
+# Start Murklet locally (creates murklet.toml and ./assets if absent)
+task dev
+
+# In another terminal, run the HTTP smoke test (healthz, MISS, HIT, 304)
+task smoke
+```
+
+Or run Cargo directly:
 
 ```bash
 # 1. Prepare a configuration file and sample assets directory
