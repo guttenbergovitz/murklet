@@ -1,5 +1,6 @@
 //! Declarative TOML configuration and startup policy validation.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use crate::engine::{
 };
 use crate::origin::{DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig};
 use crate::policy::error::PolicyError;
+use crate::policy::presets::{PresetConfig, PresetRegistry};
 use crate::policy::signing::RequestSigner;
 
 /// Default `Cache-Control` header applied to served image variants.
@@ -38,6 +40,20 @@ pub struct MurkletConfig {
     /// Enabled origins and their access policies.
     #[serde(default)]
     pub origins: OriginsConfig,
+    /// Optional named transformation presets (`[presets.<name>]`).
+    #[serde(default)]
+    pub presets: BTreeMap<String, PresetConfig>,
+}
+
+/// Structured log output format (`server.log_format`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormatConfig {
+    /// Human-readable structured logs for local development.
+    #[default]
+    Pretty,
+    /// Machine-readable JSON log lines for production log aggregators.
+    Json,
 }
 
 /// HTTP transport and operational settings (`[server]`).
@@ -53,6 +69,12 @@ pub struct ServerConfig {
     /// Negotiate output format from the HTTP `Accept` header when `f` is omitted (default `false`).
     #[serde(default)]
     pub accept_negotiation: bool,
+    /// Expose Prometheus metrics at `GET /metrics` (default `true`).
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+    /// Structured log format (`"pretty"` or `"json"`, default `"pretty"`).
+    #[serde(default)]
+    pub log_format: LogFormatConfig,
     /// Emit extended `X-Original-*` / `X-Processed-*` headers on cache MISS (default `false`).
     #[serde(default)]
     pub diagnostic_headers: bool,
@@ -70,6 +92,8 @@ impl Default for ServerConfig {
             bind: default_bind_addr(),
             cache_control: default_cache_control(),
             accept_negotiation: false,
+            metrics_enabled: true,
+            log_format: LogFormatConfig::Pretty,
             diagnostic_headers: false,
             cleanup_token: None,
             signing_secret: None,
@@ -289,6 +313,15 @@ impl MurkletConfig {
             .transpose()
     }
 
+    /// Builds a validated [`PresetRegistry`] from `[presets.*]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::Validation`] if any preset is invalid.
+    pub fn preset_registry(&self) -> Result<PresetRegistry, PolicyError> {
+        PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)
+    }
+
     /// Builds an [`HttpOriginConfig`] when `[origins.http]` is enabled, or `None` when disabled.
     #[must_use]
     pub fn http_origin_config(&self) -> Option<HttpOriginConfig> {
@@ -381,6 +414,9 @@ impl MurkletConfig {
                 ));
             }
         }
+
+        // Validate all declared named presets eagerly at startup.
+        let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
 
         Ok(())
     }

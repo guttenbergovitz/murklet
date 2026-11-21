@@ -5,6 +5,8 @@
 bind = "127.0.0.1:9876"
 cache_control = "public, max-age=31536000, immutable"
 accept_negotiation = false
+metrics_enabled = true
+log_format = "pretty" # "pretty" | "json"
 diagnostic_headers = false
 # Secret token for `POST /cache/cleanup` (sent via `X-Cache-Cleanup-Token`).
 # Leave commented out to keep cache cleanup disabled (fail-closed).
@@ -37,3 +39,9 @@ allowed_hosts = []
 timeout_secs = 15
 connect_timeout_secs = 5
 max_redirects = 5
+
+# Optional named transformation presets referenced via `?preset=<name>`.
+# [presets.thumb]
+# width = 300
+# format = "webp"
+# quality = 80

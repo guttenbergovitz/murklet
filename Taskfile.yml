@@ -30,6 +30,11 @@ tasks:
     cmds:
       - cargo test --locked
 
+  bench:
+    desc: Run reproducible Criterion benchmarks for the image engine
+    cmds:
+      - cargo bench --locked
+
   check:
     desc: Run the full CI quality gate (format, clippy, and tests)
     deps:

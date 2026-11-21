@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** `v0.2.0` (early release). Core image proxy capabilities — local filesystem and SSRF-hardened HTTP(S) origins, pure-Rust static image engine (JPEG, PNG, WebP, GIF, and AVIF), sharded filesystem cache with request coalescing, declarative TOML configuration, optional HMAC-SHA256 request signing, and `Accept` format negotiation — are implemented and tested. S3-compatible origins, named presets, and telemetry exporters remain planned.
+> **Project status:** `v0.3.0` (early release). Implemented and tested: local filesystem and SSRF-hardened HTTP(S) origins, pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), sharded filesystem cache with request coalescing, declarative TOML configuration with named presets and `murklet explain`, optional HMAC-SHA256 request signing, `Accept` format negotiation, structured `tracing` logs, Prometheus `/metrics`, and Criterion benchmarks. S3-compatible origins and OpenTelemetry exporters remain planned.
 
 ## Motivation
 
@@ -106,11 +106,11 @@ Design principles: clear boundaries between transport, origins, security policy,
 
 ## Technology direction
 
-- **Runtime:** Rust, Tokio, and an HTTP layer such as Axum/Hyper.
-- **Configuration:** Serde and TOML (proposed).
-- **Image engine:** Evaluate `libvips` and Rust-native alternatives against correctness, security, performance, deployment size, and maintenance cost before committing.
-- **Telemetry:** `tracing`, optional OpenTelemetry integration, Prometheus-compatible metrics.
-- **Testing:** Unit and integration tests, property-based tests, fuzzing for untrusted input paths, golden-image tests, and reproducible benchmarks.
+- **Runtime:** Rust (edition 2024), Tokio, and Axum/Hyper.
+- **Configuration:** Serde and TOML (`murklet.example.toml`, strict `deny_unknown_fields`, `--check`, and `explain`).
+- **Image engine:** Pure-Rust stack (`image` + SIMD `fast_image_resize` + `ravif`/`rav1e`) behind a replaceable engine boundary (see [ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md)).
+- **Telemetry:** `tracing` (`pretty` / `json` logs), lock-free Prometheus `/metrics`, and optional future OpenTelemetry integration.
+- **Testing:** Unit and integration tests, Criterion benchmarks (`task bench`), and planned fuzzing and golden-image tests.
 
 Rust is an implementation choice, not a substitute for architectural discipline or scrutiny of native dependencies.
 
@@ -136,11 +136,17 @@ Requires Rust 1.85+ (edition 2024). If you have [Task](https://taskfile.dev/) in
 # Run the full CI gate (format, Clippy, tests)
 task check
 
-# Start Murklet locally (creates murklet.toml and ./assets if absent)
-task dev
+# Start Murklet locally with optimised release build (recommended for AVIF)
+task dev:release
 
 # In another terminal, run the HTTP smoke test (healthz, MISS, HIT, 304)
 task smoke
+
+# Inspect how Murklet evaluates a request and computes its canonical cache key
+cargo run -- explain "/load?url=sample.png&w=400&f=webp" murklet.example.toml
+
+# Run reproducible image-engine benchmarks
+task bench
 ```
 
 Or run Cargo directly:
@@ -160,8 +166,9 @@ cargo run -- murklet.toml
 Example requests:
 
 ```bash
-# Health check
+# Health check and Prometheus metrics
 curl http://127.0.0.1:9876/healthz
+curl http://127.0.0.1:9876/metrics
 
 # Resize and convert a local asset to WebP
 curl -i "http://127.0.0.1:9876/load?url=sample.png&w=800&q=80&f=webp" -o out.webp
@@ -173,7 +180,7 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cle
 To build a minimal container image:
 
 ```bash
-docker build -t murklet:0.2.0 .
+docker build -t murklet:0.3.0 .
 ```
 
 ## Documentation

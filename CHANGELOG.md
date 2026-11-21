@@ -4,6 +4,15 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-21
+
+### Added
+
+- **Structured logging & Prometheus metrics (`src/http/metrics.rs`):** Initialised `tracing-subscriber` with configurable `server.log_format` (`pretty` / `json`) and `RUST_LOG` filtering, and exposed lock-free, low-cardinality Prometheus metrics (`murklet_load_requests_total`, `murklet_transforms_total`, `murklet_in_flight_transforms`, `murklet_transform_duration_seconds`, `murklet_cache_cleanups_total`) at `GET /metrics` (controlled by `server.metrics_enabled`).
+- **Declarative named presets (`src/policy/presets.rs`):** Added validated `[presets.<name>]` sections in `murklet.toml`, `?preset=<name>` support on `GET /load` with explicit query overrides, and shared canonical `CacheKey` identities between preset and equivalent explicit queries.
+- **Policy inspection CLI (`src/http/explain.rs`):** Added `murklet explain [--accept <header>] <load-url-or-query> [config]` to evaluate signatures, origins, presets, limits, and canonical cache keys offline without starting the server.
+- **SIMD resampling & benchmarks (`src/engine/pipeline.rs`, `benches/engine_resize.rs`):** Replaced `image`'s scalar resampler with SIMD-accelerated `fast_image_resize` (3-channel `Rgb8` for opaque images, 4-channel `Rgba8` for alpha images, exact kernel mappings) and added reproducible Criterion benchmarks via `task bench`.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added
