@@ -708,10 +708,6 @@ mod tests {
             ("/load?url=../secret.png", StatusCode::BAD_REQUEST),
             ("/load?url=missing.png", StatusCode::NOT_FOUND),
             ("/load?url=https://example.com/a.png", StatusCode::FORBIDDEN),
-            (
-                "/load?url=sample.png&f=avif",
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ),
         ] {
             let response = app
                 .clone()
@@ -898,13 +894,13 @@ mod tests {
         state.accept_negotiation = true;
         let app = build_router(Arc::new(state));
 
-        // Omitted `f` with browser Accept header negotiates WebP and sets Vary: Accept.
+        // Omitted `f` with Accept: image/webp negotiates WebP and sets Vary: Accept.
         let webp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/load?url=sample.png&w=40")
-                    .header(ACCEPT, "image/avif,image/webp,*/*;q=0.8")
+                    .header(ACCEPT, "image/webp,*/*;q=0.8")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -914,6 +910,22 @@ mod tests {
         assert_eq!(webp.headers().get(CONTENT_TYPE).unwrap(), "image/webp");
         assert_eq!(webp.headers().get(VARY).unwrap(), "Accept");
         assert_eq!(webp.headers().get("x-cache").unwrap(), "MISS");
+
+        // Omitted `f` with browser Accept including image/avif negotiates AVIF.
+        let avif = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=16")
+                    .header(ACCEPT, "image/avif,image/webp,*/*;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(avif.status(), StatusCode::OK);
+        assert_eq!(avif.headers().get(CONTENT_TYPE).unwrap(), "image/avif");
+        assert_eq!(avif.headers().get(VARY).unwrap(), "Accept");
 
         // Same URL with Accept: image/jpeg gets a distinct JPEG variant (no cache poisoning).
         let jpeg = app

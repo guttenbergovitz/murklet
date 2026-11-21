@@ -49,11 +49,18 @@ tasks:
       - mkdir -p assets
 
   dev:
-    desc: Start Murklet locally using murklet.toml
+    desc: Start Murklet locally using murklet.toml (debug build)
     deps:
       - dev:init
     cmds:
       - cargo run --locked -- {{.CONFIG}}
+
+  dev:release:
+    desc: Start Murklet locally with optimised release build (recommended for AVIF)
+    deps:
+      - dev:init
+    cmds:
+      - cargo run --release --locked -- {{.CONFIG}}
 
   smoke:
     desc: Run an HTTP smoke test (healthz, MISS, HIT, and 304 Not Modified) against a running server
