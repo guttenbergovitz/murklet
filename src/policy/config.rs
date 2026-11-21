@@ -15,6 +15,7 @@ use crate::engine::{
 use crate::http::DEFAULT_CACHE_CONTROL;
 use crate::origin::{DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig};
 use crate::policy::error::PolicyError;
+use crate::policy::signing::RequestSigner;
 
 /// Top-level validated Murklet service and policy configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -50,6 +51,9 @@ pub struct ServerConfig {
     /// Optional secret token required by `POST /cache/cleanup`.
     #[serde(default)]
     pub cleanup_token: Option<String>,
+    /// Optional HMAC-SHA256 secret requiring a valid `sig` query parameter on `GET /load`.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -59,6 +63,7 @@ impl Default for ServerConfig {
             cache_control: default_cache_control(),
             diagnostic_headers: false,
             cleanup_token: None,
+            signing_secret: None,
         }
     }
 }
@@ -214,7 +219,7 @@ impl MurkletConfig {
         let mut config: Self =
             toml::from_str(raw).map_err(|err| PolicyError::ParseToml(err.to_string()))?;
 
-        // Normalise blank cleanup tokens to None so cleanup stays fail-closed.
+        // Normalise blank secrets to None so optional auth features stay fail-closed/disabled.
         if config
             .server
             .cleanup_token
@@ -222,6 +227,14 @@ impl MurkletConfig {
             .is_some_and(str::is_empty)
         {
             config.server.cleanup_token = None;
+        }
+        if config
+            .server
+            .signing_secret
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            config.server.signing_secret = None;
         }
 
         config.validate()?;
@@ -248,6 +261,19 @@ impl MurkletConfig {
             max_decoded_pixels: self.limits.max_decoded_pixels,
             animation_policy: self.limits.animation_policy.into(),
         }
+    }
+
+    /// Builds an optional [`RequestSigner`] when `server.signing_secret` is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::Validation`] if the configured secret is empty.
+    pub fn request_signer(&self) -> Result<Option<RequestSigner>, PolicyError> {
+        self.server
+            .signing_secret
+            .as_deref()
+            .map(|secret| RequestSigner::new(secret.as_bytes().to_vec()))
+            .transpose()
     }
 
     /// Builds an [`HttpOriginConfig`] when `[origins.http]` is enabled, or `None` when disabled.

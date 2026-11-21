@@ -59,11 +59,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache = FsCache::new(&config.cache.dir, config.cache.max_entry_bytes)?;
 
+    let request_signer = config.request_signer()?;
+
     let mut state = AppState::from_parts(local_origin, http_origin, cache);
     state.engine_limits = config.engine_limits();
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;
     state.cleanup_token = config.server.cleanup_token;
+    state.request_signer = request_signer;
     state.diagnostic_headers = config.server.diagnostic_headers;
 
     let app = build_router(Arc::new(state));

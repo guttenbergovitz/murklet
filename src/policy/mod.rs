@@ -3,9 +3,11 @@
 
 pub mod config;
 pub mod error;
+pub mod signing;
 
 pub use config::{
     AnimationPolicyConfig, CacheConfig, HttpOriginSection, LimitsConfig, LocalOriginConfig,
     MurkletConfig, OriginsConfig, ServerConfig,
 };
 pub use error::PolicyError;
+pub use signing::{RequestSigner, canonicalise_query_for_signing};

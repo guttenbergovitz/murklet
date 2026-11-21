@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -17,6 +17,7 @@ use crate::engine::{self, EngineLimits, TransformOutput};
 use crate::http::error::HttpError;
 use crate::http::query::{RawLoadQuery, parse_load_query};
 use crate::origin::{HttpOrigin, LocalFsOrigin};
+use crate::policy::RequestSigner;
 
 /// Default `Cache-Control` header applied to served image variants.
 pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -53,6 +54,8 @@ pub struct AppState {
     /// Optional secret token required by `POST /cache/cleanup`.
     /// When `None` or empty, cleanup requests fail closed with `401 Unauthorized`.
     pub cleanup_token: Option<String>,
+    /// Optional HMAC-SHA256 verifier requiring a valid `sig` parameter on `GET /load`.
+    pub request_signer: Option<RequestSigner>,
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
@@ -74,6 +77,7 @@ impl AppState {
             max_target_dimension: DEFAULT_MAX_DIMENSION,
             cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
             cleanup_token: None,
+            request_signer: None,
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
         }
@@ -115,9 +119,16 @@ async fn healthz_handler() -> impl IntoResponse {
 
 async fn load_handler(
     State(state): State<Arc<AppState>>,
+    uri: Uri,
     headers: HeaderMap,
     Query(raw_query): Query<RawLoadQuery>,
 ) -> Result<Response, HttpError> {
+    if let Some(signer) = &state.request_signer
+        && !signer.verify_raw_query(uri.query().unwrap_or(""))
+    {
+        return Err(HttpError::Unauthorized);
+    }
+
     let parsed = parse_load_query(raw_query, state.max_target_dimension)?;
     let is_remote = is_http_source(&parsed.source);
     let origin_id = if is_remote {
@@ -762,5 +773,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_cleanup.headers().get("x-cache").unwrap(), "MISS");
+    }
+
+    #[tokio::test]
+    async fn load_enforces_hmac_signature_when_request_signer_is_configured() {
+        let fixture = TestFixture::new("signing");
+        let signer = RequestSigner::new(b"test-signing-key".to_vec()).unwrap();
+        let mut state = fixture.state();
+        state.request_signer = Some(signer.clone());
+        let app = build_router(Arc::new(state));
+
+        // Unsigned request is rejected with 401.
+        let unsigned = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+        // Tampered request is rejected with 401.
+        let sig = signer.sign_raw_query("url=sample.png&w=40");
+        let tampered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/load?url=sample.png&w=80&sig={sig}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
+
+        // Valid signed request succeeds with 200.
+        let valid_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/load?url=sample.png&w=40&sig={sig}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid_response.status(), StatusCode::OK);
     }
 }

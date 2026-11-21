@@ -8,6 +8,9 @@ diagnostic_headers = false
 # Secret token for `POST /cache/cleanup` (sent via `X-Cache-Cleanup-Token`).
 # Leave commented out to keep cache cleanup disabled (fail-closed).
 # cleanup_token = "replace-with-a-strong-random-secret"
+# Optional HMAC-SHA256 secret requiring a valid `sig` query parameter on `GET /load`.
+# Leave commented out to accept unsigned transformation requests.
+# signing_secret = "replace-with-a-strong-random-secret"
 
 [cache]
 dir = "./cache"
