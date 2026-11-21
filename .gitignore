@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Local runtime cache directories
+/cache/
+/.cache/
+
 # Local environment and secrets
 .env
 .env.*
