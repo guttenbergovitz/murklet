@@ -8,7 +8,8 @@ use std::sync::Arc;
 use murklet::cache::FsCache;
 use murklet::http::{AppState, build_router};
 use murklet::origin::{HttpOrigin, LocalFsOrigin};
-use murklet::policy::MurkletConfig;
+use murklet::policy::{LogFormatConfig, MurkletConfig};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CONFIG_PATH: &str = "murklet.toml";
 
@@ -43,6 +44,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    init_tracing(config.server.log_format);
+
     let local_origin = if config.origins.local.enabled {
         Some(LocalFsOrigin::new(
             &config.origins.local.root,
@@ -58,7 +61,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
 
     let cache = FsCache::new(&config.cache.dir, config.cache.max_entry_bytes)?;
-
     let request_signer = config.request_signer()?;
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
@@ -67,19 +69,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;
     state.accept_negotiation = config.server.accept_negotiation;
+    state.metrics_enabled = config.server.metrics_enabled;
     state.cleanup_token = config.server.cleanup_token;
     state.request_signer = request_signer;
     state.diagnostic_headers = config.server.diagnostic_headers;
 
     let app = build_router(Arc::new(state));
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    eprintln!("murklet listening on http://{}", config.server.bind);
+    tracing::info!(
+        bind = %config.server.bind,
+        local_origin = config.origins.local.enabled,
+        http_origin = config.origins.http.enabled,
+        metrics_enabled = config.server.metrics_enabled,
+        "murklet server listening"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+fn init_tracing(format: LogFormatConfig) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("murklet=info"));
+
+    match format {
+        LogFormatConfig::Pretty => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+        }
+        LogFormatConfig::Json => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .try_init();
+        }
+    }
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {

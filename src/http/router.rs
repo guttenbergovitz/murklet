@@ -1,6 +1,7 @@
 //! Axum router and HTTP handlers wiring domain, origins, engine, and cache layers.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -21,6 +22,9 @@ use crate::domain::{
 };
 use crate::engine::{self, EngineLimits};
 use crate::http::error::HttpError;
+use crate::http::metrics::{
+    CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
+};
 use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query};
 use crate::origin::{HttpOrigin, LocalFsOrigin};
@@ -67,10 +71,13 @@ pub struct AppState {
     pub request_signer: Option<RequestSigner>,
     /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
     pub accept_negotiation: bool,
+    /// When `true`, exposes Prometheus metrics at `GET /metrics`.
+    pub metrics_enabled: bool,
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
     transform_permits: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -91,9 +98,11 @@ impl AppState {
             cleanup_token: None,
             request_signer: None,
             accept_negotiation: false,
+            metrics_enabled: true,
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
+            metrics: Arc::new(Metrics::new()),
         }
     }
 
@@ -125,6 +134,7 @@ impl AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/load", get(load_handler))
         .route("/cache/cleanup", post(cleanup_handler))
         .with_state(state)
@@ -138,11 +148,50 @@ async fn healthz_handler() -> impl IntoResponse {
     )
 }
 
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+    if !state.metrics_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        state.metrics.render_prometheus(),
+    )
+        .into_response()
+}
+
 async fn load_handler(
     State(state): State<Arc<AppState>>,
     uri: Uri,
     headers: HeaderMap,
     Query(raw_query): Query<RawLoadQuery>,
+) -> Response {
+    let started = Instant::now();
+    match handle_load_inner(&state, &uri, &headers, raw_query, started).await {
+        Ok(response) => response,
+        Err(err) => {
+            let response = err.into_response();
+            let status = response.status().as_u16();
+            state
+                .metrics
+                .record_load_request(CacheOutcome::None, StatusClass::from_status_code(status));
+            tracing::warn!(
+                status,
+                duration_ms = started.elapsed().as_millis(),
+                "load request failed"
+            );
+            response
+        }
+    }
+}
+
+async fn handle_load_inner(
+    state: &Arc<AppState>,
+    uri: &Uri,
+    headers: &HeaderMap,
+    raw_query: RawLoadQuery,
+    started: Instant,
 ) -> Result<Response, HttpError> {
     if let Some(signer) = &state.request_signer
         && !signer.verify_raw_query(uri.query().unwrap_or(""))
@@ -157,7 +206,7 @@ async fn load_handler(
         parsed.spec.format = negotiate_format(accept);
     }
 
-    let (origin_id, is_remote) = resolve_origin_route(&state, &parsed.source)?;
+    let (origin_id, origin_kind) = resolve_origin_route(state, &parsed.source)?;
     let cache_key = CacheKey::from_parts(origin_id, &parsed.source, &parsed.spec);
     let if_none_match = headers
         .get(IF_NONE_MATCH)
@@ -166,7 +215,7 @@ async fn load_handler(
 
     // Check cache on the blocking pool so disk I/O never stalls async worker threads.
     let cache_lookup = {
-        let state = Arc::clone(&state);
+        let state = Arc::clone(state);
         let key = cache_key.clone();
         tokio::task::spawn_blocking(move || state.cache.get(&key))
             .await
@@ -174,66 +223,108 @@ async fn load_handler(
     };
 
     if let Ok(Some(cached)) = cache_lookup {
-        if etag_matches(if_none_match.as_deref(), &cached.etag) {
-            return Ok(build_not_modified_response(
+        let response = if etag_matches(if_none_match.as_deref(), &cached.etag) {
+            build_not_modified_response(&cached.etag, &state.cache_control, "HIT", vary_accept)
+        } else {
+            build_image_response(
+                Bytes::from(cached.bytes),
+                cached.format.mime_type(),
                 &cached.etag,
                 &state.cache_control,
                 "HIT",
                 vary_accept,
-            ));
-        }
-
-        return Ok(build_image_response(
-            Bytes::from(cached.bytes),
-            cached.format.mime_type(),
-            &cached.etag,
-            &state.cache_control,
-            "HIT",
-            vary_accept,
-            None,
-        ));
+                None,
+            )
+        };
+        record_load_success(
+            state,
+            origin_kind,
+            cached.format,
+            CacheOutcome::Hit,
+            response.status().as_u16(),
+            started,
+        );
+        return Ok(response);
     }
 
     // Cache miss: coalesce concurrent requests for the same canonical variant key.
     let coalesced = state
         .coalescer
         .execute(cache_key.clone(), || {
-            let state = Arc::clone(&state);
+            let state = Arc::clone(state);
             let source = parsed.source.clone();
             let spec = parsed.spec;
             let key = cache_key.clone();
             async move {
-                fetch_transform_and_cache(state, origin_id, is_remote, source, spec, key).await
+                fetch_transform_and_cache(state, origin_id, origin_kind, source, spec, key).await
             }
         })
         .await;
 
     let outcome = coalesced.value?;
-    Ok(build_miss_response(
-        &state,
+    let response = build_miss_response(
+        state,
         &outcome,
         parsed.spec.quality.get(),
         if_none_match.as_deref(),
         coalesced.was_coalesced,
         vary_accept,
-    ))
+    );
+    let cache_outcome = if coalesced.was_coalesced {
+        CacheOutcome::Coalesced
+    } else {
+        CacheOutcome::Miss
+    };
+    record_load_success(
+        state,
+        origin_kind,
+        outcome.format,
+        cache_outcome,
+        response.status().as_u16(),
+        started,
+    );
+    Ok(response)
 }
 
-fn resolve_origin_route(state: &AppState, source: &str) -> Result<(&'static str, bool), HttpError> {
+fn record_load_success(
+    state: &AppState,
+    origin: OriginKind,
+    format: OutputFormat,
+    cache: CacheOutcome,
+    status: u16,
+    started: Instant,
+) {
+    state
+        .metrics
+        .record_load_request(cache, StatusClass::from_status_code(status));
+    tracing::info!(
+        origin = origin.as_str(),
+        format = format.as_str(),
+        cache = ?cache,
+        status,
+        duration_ms = started.elapsed().as_millis(),
+        "load request completed"
+    );
+}
+
+fn resolve_origin_route(
+    state: &AppState,
+    source: &str,
+) -> Result<(&'static str, OriginKind), HttpError> {
     if is_http_source(source) {
         if state.http_origin.is_none() {
             return Err(HttpError::Forbidden(
                 "remote HTTP(S) origins are disabled".to_owned(),
             ));
         }
-        Ok((HTTP_ORIGIN_ID, true))
+        Ok((HTTP_ORIGIN_ID, OriginKind::Http))
     } else {
         if state.local_origin.is_none() {
             return Err(HttpError::Forbidden(
                 "local filesystem origin is disabled".to_owned(),
             ));
         }
-        Ok((LOCAL_ORIGIN_ID, false))
+        Ok((LOCAL_ORIGIN_ID, OriginKind::Local))
     }
 }
 
@@ -282,24 +373,28 @@ fn build_miss_response(
 async fn fetch_transform_and_cache(
     state: Arc<AppState>,
     origin_id: &'static str,
-    is_remote: bool,
+    origin_kind: OriginKind,
     source: String,
     spec: TransformSpec,
     key: CacheKey,
 ) -> Result<Arc<MissOutcome>, HttpError> {
-    let fetched = if is_remote {
-        let http_origin = state.http_origin.as_ref().ok_or_else(|| {
-            HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
-        })?;
-        http_origin.fetch(&source).await?
-    } else {
-        let local_origin = state.local_origin.clone().ok_or_else(|| {
-            HttpError::Forbidden("local filesystem origin is disabled".to_owned())
-        })?;
-        let source_for_fs = source.clone();
-        tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
-            .await
-            .map_err(|_| HttpError::Internal)??
+    let started = Instant::now();
+    let fetched = match origin_kind {
+        OriginKind::Http => {
+            let http_origin = state.http_origin.as_ref().ok_or_else(|| {
+                HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
+            })?;
+            http_origin.fetch(&source).await?
+        }
+        OriginKind::Local => {
+            let local_origin = state.local_origin.clone().ok_or_else(|| {
+                HttpError::Forbidden("local filesystem origin is disabled".to_owned())
+            })?;
+            let source_for_fs = source.clone();
+            tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
+                .await
+                .map_err(|_| HttpError::Internal)??
+        }
     };
 
     let original_size = fetched.bytes.len();
@@ -309,7 +404,9 @@ async fn fetch_transform_and_cache(
         .acquire_owned()
         .await
         .map_err(|_| HttpError::Internal)?;
+    let _in_flight = state.metrics.track_in_flight();
 
+    let metrics = Arc::clone(&state.metrics);
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
         let output = engine::transform(&fetched.bytes, &spec, &state.engine_limits)?;
 
@@ -327,6 +424,8 @@ async fn fetch_transform_and_cache(
             Ok(stored) => stored.etag,
             Err(_) => compute_etag(&output.bytes),
         };
+
+        metrics.record_transform(origin_kind, output.format, started.elapsed());
 
         Ok(Arc::new(MissOutcome {
             bytes: Bytes::from(output.bytes),
@@ -383,9 +482,12 @@ async fn cleanup_handler(
     }
 
     let cache = state.cache.clone();
-    tokio::task::spawn_blocking(move || cache.cleanup())
+    let removed = tokio::task::spawn_blocking(move || cache.cleanup())
         .await
         .map_err(|_| HttpError::Internal)??;
+
+    state.metrics.record_cache_cleanup();
+    tracing::info!(removed_files = removed, "cache cleanup completed");
 
     Ok((StatusCode::OK, "Cache cleaned successfully").into_response())
 }
@@ -961,5 +1063,65 @@ mod tests {
             "image/png"
         );
         assert!(explicit_png.headers().get(VARY).is_none());
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_prometheus_counters_and_respects_toggle() {
+        let fixture = TestFixture::new("metrics");
+        let app = build_router(Arc::new(fixture.state()));
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=32&f=webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let metrics_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(metrics_res.status(), StatusCode::OK);
+        assert_eq!(
+            metrics_res.headers().get(CONTENT_TYPE).unwrap(),
+            PROMETHEUS_CONTENT_TYPE
+        );
+        let body = String::from_utf8(
+            metrics_res
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("murklet_load_requests_total{cache=\"miss\",status=\"200\"} 1"));
+        assert!(body.contains("murklet_transforms_total{origin=\"local\",format=\"webp\"} 1"));
+
+        // Disabled metrics endpoint returns 404.
+        let mut disabled_state = fixture.state();
+        disabled_state.metrics_enabled = false;
+        let disabled_app = build_router(Arc::new(disabled_state));
+        let not_found = disabled_app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
     }
 }

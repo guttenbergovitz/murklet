@@ -40,6 +40,17 @@ pub struct MurkletConfig {
     pub origins: OriginsConfig,
 }
 
+/// Structured log output format (`server.log_format`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormatConfig {
+    /// Human-readable structured logs for local development.
+    #[default]
+    Pretty,
+    /// Machine-readable JSON log lines for production log aggregators.
+    Json,
+}
+
 /// HTTP transport and operational settings (`[server]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +64,12 @@ pub struct ServerConfig {
     /// Negotiate output format from the HTTP `Accept` header when `f` is omitted (default `false`).
     #[serde(default)]
     pub accept_negotiation: bool,
+    /// Expose Prometheus metrics at `GET /metrics` (default `true`).
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+    /// Structured log format (`"pretty"` or `"json"`, default `"pretty"`).
+    #[serde(default)]
+    pub log_format: LogFormatConfig,
     /// Emit extended `X-Original-*` / `X-Processed-*` headers on cache MISS (default `false`).
     #[serde(default)]
     pub diagnostic_headers: bool,
@@ -70,6 +87,8 @@ impl Default for ServerConfig {
             bind: default_bind_addr(),
             cache_control: default_cache_control(),
             accept_negotiation: false,
+            metrics_enabled: true,
+            log_format: LogFormatConfig::Pretty,
             diagnostic_headers: false,
             cleanup_token: None,
             signing_secret: None,
