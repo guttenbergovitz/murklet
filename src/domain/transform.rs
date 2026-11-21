@@ -8,6 +8,7 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use crate::domain::error::{Axis, DomainError};
+use crate::domain::filters::ImageFilters;
 use crate::domain::geometry::{BackgroundColour, FitMode, Gravity, Rotation};
 
 /// Default maximum width or height accepted by baseline transformation requests.
@@ -413,6 +414,8 @@ pub struct TransformSpec {
     pub rotation: Rotation,
     /// Optional RGB background colour used to flatten alpha on opaque outputs (such as JPEG).
     pub background: Option<BackgroundColour>,
+    /// Post-resize pixel filters and mirror flip.
+    pub filters: ImageFilters,
 }
 
 impl TransformSpec {
@@ -465,6 +468,7 @@ impl TransformSpec {
             out.push_str("|bg=");
             out.push_str(&bg.to_hex());
         }
+        self.filters.append_canonical(&mut out);
         out
     }
 }

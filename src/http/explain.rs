@@ -66,7 +66,7 @@ impl fmt::Display for ExplainReport {
                 writeln!(f, "Preset:    {}", preset.as_deref().unwrap_or("none"))?;
                 writeln!(
                     f,
-                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={}",
+                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={} filters={}",
                     spec.format,
                     spec.quality.get(),
                     spec.dimensions
@@ -84,6 +84,7 @@ impl fmt::Display for ExplainReport {
                         || "none".to_owned(),
                         crate::domain::BackgroundColour::to_hex
                     ),
+                    spec.filters,
                 )?;
                 writeln!(f, "Canonical: {}", spec.canonical_representation())?;
                 writeln!(
@@ -242,6 +243,18 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "rotate" => out.rotate = Some(value.into_owned()),
             "dpr" => out.dpr = Some(value.into_owned()),
             "bg" => out.bg = Some(value.into_owned()),
+            "flip" => out.flip = Some(value.into_owned()),
+            "grayscale" | "greyscale" => out.grayscale = Some(value.into_owned()),
+            "invert" | "negative" => out.invert = Some(value.into_owned()),
+            "blur" => out.blur = Some(value.into_owned()),
+            "sharpen" => out.sharpen = Some(value.into_owned()),
+            "brightness" => out.brightness = Some(value.into_owned()),
+            "contrast" => out.contrast = Some(value.into_owned()),
+            "saturation" => out.saturation = Some(value.into_owned()),
+            "hue" => out.hue = Some(value.into_owned()),
+            "gamma" => out.gamma = Some(value.into_owned()),
+            "sepia" => out.sepia = Some(value.into_owned()),
+            "tint" | "mono" | "monochrome" => out.tint = Some(value.into_owned()),
             _ => {}
         }
     }
