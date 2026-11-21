@@ -252,9 +252,9 @@ impl FsCache {
             });
         }
 
-        let shard_dir = self.root.join(key.shard_dir());
-        let final_path = shard_dir.join(key.file_name());
-        Self::write_entry_atomic(&shard_dir, key.digest_hex(), &final_path, bytes)?;
+        let entry_dir = self.entry_dir(key);
+        let final_path = entry_dir.join(key.file_name());
+        Self::write_entry_atomic(&entry_dir, key.digest_hex(), &final_path, bytes)?;
 
         let etag = compute_etag(bytes);
         Ok(CachedVariant {
@@ -277,6 +277,67 @@ impl FsCache {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(CacheError::Io(err.kind().to_string())),
         }
+    }
+
+    /// Deletes a single raw source blob (`<shard>/<digest>.src`) if present.
+    ///
+    /// Returns `Ok(true)` when removed and `Ok(false)` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Io`] on unexpected filesystem errors.
+    pub fn delete_raw(&self, digest_hex: &str) -> Result<bool, CacheError> {
+        let path = self.raw_entry_path(digest_hex);
+        let removed = match fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(err) => return Err(CacheError::Io(err.kind().to_string())),
+        };
+        if removed && let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(removed)
+    }
+
+    /// Removes all cached variants belonging to `source_digest_hex` in O(1) directory lookup,
+    /// leaving all other cached sources and in-flight hidden temp files untouched.
+    ///
+    /// Returns the number of cached variant files removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Io`] on unexpected filesystem errors.
+    pub fn purge_source(&self, source_digest_hex: &str) -> Result<u64, CacheError> {
+        let shard = source_digest_hex.get(..2).unwrap_or("00");
+        let shard_dir = self.root.join(shard);
+        let source_dir = shard_dir.join(source_digest_hex);
+
+        let entries = match fs::read_dir(&source_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(CacheError::Io(err.kind().to_string())),
+        };
+
+        let mut removed: u64 = 0;
+        for entry in entries {
+            let entry = entry.map_err(|err| CacheError::Io(err.kind().to_string()))?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            if remove_entry_best_effort(&entry.path())? {
+                removed += 1;
+            }
+        }
+
+        // Prune empty source and shard directories best-effort.
+        let _ = fs::remove_dir(&source_dir);
+        let _ = fs::remove_dir(&shard_dir);
+
+        Ok(removed)
     }
 
     /// Removes all cached files and shard subdirectories inside `self.root` while
@@ -354,8 +415,14 @@ impl FsCache {
         Ok(report)
     }
 
+    fn entry_dir(&self, key: &CacheKey) -> PathBuf {
+        self.root
+            .join(key.shard_dir())
+            .join(key.source_digest_hex())
+    }
+
     fn entry_path(&self, key: &CacheKey) -> PathBuf {
-        self.root.join(key.shard_dir()).join(key.file_name())
+        self.entry_dir(key).join(key.file_name())
     }
 
     fn raw_entry_path(&self, digest_hex: &str) -> PathBuf {
@@ -372,47 +439,42 @@ struct DiskEntry {
 
 fn collect_cache_entries(root: &Path) -> Result<Vec<DiskEntry>, CacheError> {
     let mut out = Vec::new();
-    let shards = fs::read_dir(root).map_err(|err| CacheError::Io(err.kind().to_string()))?;
+    collect_cache_entries_in(root, &mut out)?;
+    Ok(out)
+}
 
-    for shard in shards {
-        let shard = shard.map_err(|err| CacheError::Io(err.kind().to_string()))?;
-        let Ok(shard_type) = shard.file_type() else {
-            continue;
-        };
-        if !shard_type.is_dir() {
+fn collect_cache_entries_in(dir: &Path, out: &mut Vec<DiskEntry>) -> Result<(), CacheError> {
+    let entries = fs::read_dir(dir).map_err(|err| CacheError::Io(err.kind().to_string()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| CacheError::Io(err.kind().to_string()))?;
+        // Skip hidden atomic-write temp files (`.<digest>.tmp-*`).
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
             continue;
         }
-        let Ok(files) = fs::read_dir(shard.path()) else {
+        let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        for file in files {
-            let Ok(file) = file else {
+        if file_type.is_dir() {
+            collect_cache_entries_in(&entry.path(), out)?;
+        } else if file_type.is_file() {
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            // Skip hidden atomic-write temp files (`.<digest>.tmp-*`).
-            if file
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with('.'))
-            {
-                continue;
-            }
-            let Ok(meta) = file.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
             let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             out.push(DiskEntry {
-                path: file.path(),
+                path: entry.path(),
                 size: meta.len(),
                 modified,
             });
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 fn remove_entry_best_effort(path: &Path) -> Result<bool, CacheError> {
@@ -424,13 +486,15 @@ fn remove_entry_best_effort(path: &Path) -> Result<bool, CacheError> {
 }
 
 fn prune_empty_shard_dirs(root: &Path) {
-    let Ok(shards) = fs::read_dir(root) else {
+    let Ok(entries) = fs::read_dir(root) else {
         return;
     };
-    for shard in shards.flatten() {
-        if shard.file_type().is_ok_and(|ft| ft.is_dir()) {
-            // `remove_dir` succeeds only when the shard directory is completely empty.
-            let _ = fs::remove_dir(shard.path());
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let path = entry.path();
+            prune_empty_shard_dirs(&path);
+            // `remove_dir` succeeds only when the directory is completely empty.
+            let _ = fs::remove_dir(&path);
         }
     }
 }
@@ -687,5 +751,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.get_raw(&digest).unwrap(), None);
+    }
+
+    #[test]
+    fn purge_source_and_delete_raw_isolate_target_asset() {
+        let temp = TempCacheDir::new("purge-source");
+        let cache = FsCache::new(&temp.path, 4096).unwrap();
+
+        let webp_spec = TransformSpec {
+            format: OutputFormat::Webp,
+            ..TransformSpec::default()
+        };
+        let jpg_spec = TransformSpec {
+            format: OutputFormat::Jpeg,
+            ..TransformSpec::default()
+        };
+
+        let hero_webp = CacheKey::from_parts("local", "hero.png", &webp_spec);
+        let hero_jpg = CacheKey::from_parts("local", "hero.png", &jpg_spec);
+        let other_webp = CacheKey::from_parts("local", "other.png", &webp_spec);
+
+        cache.put(&hero_webp, b"hero-webp").unwrap();
+        cache.put(&hero_jpg, b"hero-jpg").unwrap();
+        cache.put(&other_webp, b"other-webp").unwrap();
+
+        let digest_a = crate::cache::source_digest_hex("local", "hero.png");
+        let removed = cache.purge_source(&digest_a).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(cache.get(&hero_webp).unwrap(), None);
+        assert_eq!(cache.get(&hero_jpg).unwrap(), None);
+        assert!(cache.get(&other_webp).unwrap().is_some());
+
+        // Purging again is a clean idempotent no-op.
+        assert_eq!(cache.purge_source(&digest_a).unwrap(), 0);
+
+        // Raw source blob deletion works and is idempotent.
+        cache.put_raw(&digest_a, b"raw-bytes").unwrap();
+        assert!(cache.delete_raw(&digest_a).unwrap());
+        assert!(!cache.delete_raw(&digest_a).unwrap());
+        assert_eq!(cache.get_raw(&digest_a).unwrap(), None);
     }
 }
