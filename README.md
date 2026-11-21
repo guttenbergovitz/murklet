@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** `v0.1.0` (early release). Core image proxy capabilities (local filesystem and SSRF-hardened HTTP(S) origins, pure-Rust static image engine, sharded filesystem cache with request coalescing, declarative TOML configuration, optional HMAC-SHA256 request signing, and `Accept` format negotiation) are implemented and tested. S3-compatible origins, AVIF encoding, and telemetry exporters remain planned.
+> **Project status:** `v0.2.0` (early release). Core image proxy capabilities — local filesystem and SSRF-hardened HTTP(S) origins, pure-Rust static image engine (JPEG, PNG, WebP, GIF, and AVIF), sharded filesystem cache with request coalescing, declarative TOML configuration, optional HMAC-SHA256 request signing, and `Accept` format negotiation — are implemented and tested. S3-compatible origins, named presets, and telemetry exporters remain planned.
 
 ## Motivation
 
@@ -45,7 +45,7 @@ Initial target: HTTP(S), local filesystem, and S3-compatible storage. Public arb
 
 - On-demand resize, crop, fit/fill, and rotation.
 - Quality and compression controls.
-- JPEG, PNG, and WebP, with AVIF as a planned addition.
+- JPEG, PNG, WebP, GIF, and AVIF (pure-Rust encoding).
 - Format negotiation via the HTTP `Accept` header (with explicit `Vary` and CDN cache-key awareness).
 - EXIF orientation handling, sensible defaults, and configurable limits.
 - Stable, documented URL semantics suitable for use behind a CDN.
@@ -173,7 +173,7 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cle
 To build a minimal container image:
 
 ```bash
-docker build -t murklet:0.1.0 .
+docker build -t murklet:0.2.0 .
 ```
 
 ## Documentation
