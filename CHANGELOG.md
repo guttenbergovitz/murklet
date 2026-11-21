@@ -4,6 +4,14 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-21
+
+### Added
+
+- **Pure-Rust AVIF output encoding (`src/engine`):** Enabled the pure-Rust `avif` feature (`ravif`/`rav1e`) in the `image` crate with speed preset `8` for on-demand HTTP delivery and quality (`1..=100`) support.
+- **AVIF `Accept` negotiation (`src/http`):** Updated `negotiate_format` to prefer `AVIF > WebP > JPEG > PNG` when `server.accept_negotiation = true` and `f` is omitted.
+- **Developer workflow (`Taskfile.yml`):** Added `Taskfile.yml` with `check`, `fmt`, `lint`, `test`, `config:check`, `dev`, `dev:release` (recommended for AVIF), `smoke` (healthz, MISS, HIT, `304`), and `docker:build`, and ignored local `murklet.toml` and `/assets/` in `.gitignore`.
+
 ## [0.1.0] - 2026-11-21
 
 ### Added
