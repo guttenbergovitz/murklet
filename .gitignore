@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Local runtime cache directories
+/cache/
+/.cache/
+
 # Local environment and secrets
 .env
 .env.*
@@ -13,8 +17,9 @@
 !.specs/README.md
 
 # AI agent local state and scratch files
+# Canonical project skills live in .agents/skills/ and are tracked in Git.
 .agent/
-.agents/
+.agents/*.local.*
 .aider*
 .claude/
 .codex/

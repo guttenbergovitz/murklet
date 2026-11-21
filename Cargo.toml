@@ -1,0 +1,39 @@
+[package]
+name = "murklet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Image proxy and on-demand image transformation service."
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+blake3 = "1"
+bytes = "1"
+hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+toml = "0.8"
+url = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+clone_on_ref_ptr = "deny"

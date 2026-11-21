@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** Design / early development. This README describes the intended direction rather than a list of implemented features. APIs, configuration, and milestones may change.
+> **Project status:** `v0.1.0` (early release). Core image proxy capabilities (local filesystem and SSRF-hardened HTTP(S) origins, pure-Rust static image engine, sharded filesystem cache with request coalescing, declarative TOML configuration, optional HMAC-SHA256 request signing, and `Accept` format negotiation) are implemented and tested. S3-compatible origins, AVIF encoding, and telemetry exporters remain planned.
 
 ## Motivation
 
@@ -128,14 +128,47 @@ These are planning targets, not release commitments.
 
 Murklet is not a digital asset manager, browser image editor, image generation service, generic API gateway, mandatory distributed platform, or governance dashboard disguised as an image proxy.
 
+## Quickstart
+
+Requires Rust 1.85+ (edition 2024).
+
+```bash
+# 1. Prepare a configuration file and sample assets directory
+cp murklet.example.toml murklet.toml
+mkdir -p assets
+
+# 2. Validate configuration without starting the server
+cargo run -- --check murklet.toml
+
+# 3. Start Murklet (binds 127.0.0.1:9876 by default)
+cargo run -- murklet.toml
+```
+
+Example requests:
+
+```bash
+# Health check
+curl http://127.0.0.1:9876/healthz
+
+# Resize and convert a local asset to WebP
+curl -i "http://127.0.0.1:9876/load?url=sample.png&w=800&q=80&f=webp" -o out.webp
+
+# Purge cache (when server.cleanup_token is configured)
+curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cleanup
+```
+
+To build a minimal container image:
+
+```bash
+docker build -t murklet:0.1.0 .
+```
+
 ## Documentation
 
 - [Engineering and Git Conventions](docs/conventions.md) — coding standards, Git Flow, SemVer, and commit guidelines.
 - [Architecture Decision Records](docs/adr/README.md) — lightweight record of key technical decisions.
-
-## Current state
-
-There is no stable API or production-ready release yet. Installation, configuration, CLI examples, container images, and benchmarks will be added once implemented and verified.
+- [Example Configuration](murklet.example.toml) — annotated TOML policy reference.
+- [Changelog](CHANGELOG.md) — release history.
 
 ## Licence
 

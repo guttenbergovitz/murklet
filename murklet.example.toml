@@ -1,0 +1,39 @@
+# Murklet example configuration.
+# Validate without starting the server: `murklet --check murklet.example.toml`
+
+[server]
+bind = "127.0.0.1:9876"
+cache_control = "public, max-age=31536000, immutable"
+accept_negotiation = false
+diagnostic_headers = false
+# Secret token for `POST /cache/cleanup` (sent via `X-Cache-Cleanup-Token`).
+# Leave commented out to keep cache cleanup disabled (fail-closed).
+# cleanup_token = "replace-with-a-strong-random-secret"
+# Optional HMAC-SHA256 secret requiring a valid `sig` query parameter on `GET /load`.
+# Leave commented out to accept unsigned transformation requests.
+# signing_secret = "replace-with-a-strong-random-secret"
+
+[cache]
+dir = "./cache"
+max_entry_bytes = 52428800 # 50 MiB
+
+[limits]
+max_input_bytes = 52428800 # 50 MiB
+max_source_dimension = 16384
+max_target_dimension = 8192
+max_decoded_pixels = 64000000
+max_concurrent_transforms = 8
+# Fallback for multi-frame GIF/WebP inputs: "first_frame" or "passthrough"
+animation_policy = "first_frame"
+
+[origins.local]
+enabled = true
+root = "./assets"
+
+[origins.http]
+# Remote fetching is disabled by default; enabling it requires a non-empty allowlist.
+enabled = false
+allowed_hosts = []
+timeout_secs = 15
+connect_timeout_secs = 5
+max_redirects = 5
