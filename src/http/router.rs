@@ -1174,6 +1174,7 @@ mod tests {
                 quality: Some(80),
                 format: Some("webp".to_owned()),
                 filter: None,
+                ..PresetConfig::default()
             },
         );
 

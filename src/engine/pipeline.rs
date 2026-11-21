@@ -16,7 +16,10 @@ use image::{
     ImageReader, Limits, RgbImage, RgbaImage,
 };
 
-use crate::domain::{ImageDimensions, OutputFormat, ResizeFilter, SelectedFilter, TransformSpec};
+use crate::domain::{
+    BackgroundColour, ImageDimensions, OutputFormat, ResizeFilter, Rotation, SelectedFilter,
+    TransformSpec, plan_resize,
+};
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
 
@@ -77,17 +80,27 @@ pub fn transform(
         });
     }
 
-    let decoded = decode_with_orientation(input, input_format, limits)?;
+    let decoded = apply_rotation(
+        decode_with_orientation(input, input_format, limits)?,
+        spec.rotation,
+    );
     let source_dimensions = ImageDimensions::new(decoded.width(), decoded.height())
         .map_err(|err| EngineError::DecodeFailed(err.to_string()))?;
 
-    let output_dimensions = spec.dimensions.resolve(source_dimensions);
-    let filter = ResizeFilter::select_for(spec.filter, source_dimensions, output_dimensions);
+    let plan = plan_resize(source_dimensions, spec.dimensions, spec.fit, spec.gravity);
+    let cropped = match plan.crop {
+        Some(rect) => decoded.crop_imm(rect.x, rect.y, rect.width, rect.height),
+        None => decoded,
+    };
+    let cropped_dimensions = ImageDimensions::new(cropped.width(), cropped.height())
+        .map_err(|err| EngineError::DecodeFailed(err.to_string()))?;
 
-    let processed = if output_dimensions == source_dimensions {
-        decoded
+    let filter = ResizeFilter::select_for(spec.filter, cropped_dimensions, plan.output);
+
+    let processed = if plan.output == cropped_dimensions {
+        cropped
     } else {
-        resize_image(decoded, output_dimensions, filter.filter)?
+        resize_image(cropped, plan.output, filter.filter)?
     };
 
     let bytes = encode_image(processed, spec)?;
@@ -96,7 +109,7 @@ pub fn transform(
         bytes,
         format: spec.format,
         source_dimensions,
-        output_dimensions,
+        output_dimensions: plan.output,
         filter,
         was_passthrough: false,
     })
@@ -264,13 +277,51 @@ const fn map_resize_alg(filter: ResizeFilter) -> ResizeAlg {
     }
 }
 
+fn apply_rotation(image: DynamicImage, rotation: Rotation) -> DynamicImage {
+    match rotation {
+        Rotation::Deg0 => image,
+        Rotation::Deg90 => image.rotate90(),
+        Rotation::Deg180 => image.rotate180(),
+        Rotation::Deg270 => image.rotate270(),
+    }
+}
+
+/// Composites an alpha-bearing image over a solid RGB background colour using
+/// exact integer blending (`(fg * a + bg * (255 - a) + 127) / 255`).
+fn flatten_over_background(image: DynamicImage, bg: BackgroundColour) -> RgbImage {
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut rgb = RgbImage::new(width, height);
+
+    for (dst, src) in rgb.pixels_mut().zip(rgba.pixels()) {
+        let [sr, sg, sb, sa] = src.0;
+        let alpha = u16::from(sa);
+        let inv_alpha = 255 - alpha;
+
+        let blend = |fg: u8, bg_ch: u8| -> u8 {
+            let mixed = (u16::from(fg) * alpha + u16::from(bg_ch) * inv_alpha + 127) / 255;
+            u8::try_from(mixed).unwrap_or(255)
+        };
+
+        dst.0 = [blend(sr, bg.r), blend(sg, bg.g), blend(sb, bg.b)];
+    }
+
+    rgb
+}
+
 /// Encodes a processed image into the format and quality requested in `spec`.
 fn encode_image(image: DynamicImage, spec: &TransformSpec) -> Result<Vec<u8>, EngineError> {
     let mut output = Vec::new();
 
     match spec.format {
         OutputFormat::Jpeg => {
-            let rgb = image.into_rgb8();
+            let rgb = if image.color().has_alpha()
+                && let Some(bg) = spec.background
+            {
+                flatten_over_background(image, bg)
+            } else {
+                image.into_rgb8()
+            };
             let mut encoder = JpegEncoder::new_with_quality(&mut output, spec.quality.get());
             encoder
                 .encode_image(&rgb)
@@ -384,6 +435,7 @@ mod tests {
             format: OutputFormat::Avif,
             quality: Quality::new(70).unwrap(),
             filter: None,
+            ..TransformSpec::default()
         };
 
         let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
@@ -442,6 +494,7 @@ mod tests {
                 format,
                 quality: Quality::new(80).unwrap(),
                 filter: None,
+                ..TransformSpec::default()
             };
 
             let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
@@ -501,6 +554,7 @@ mod tests {
             format: OutputFormat::Png,
             quality: Quality::DEFAULT,
             filter: None,
+            ..TransformSpec::default()
         };
 
         // Default policy: transforms the first frame to the requested format and size.
@@ -525,5 +579,50 @@ mod tests {
             passthrough.output_dimensions,
             ImageDimensions::new(32, 16).unwrap()
         );
+    }
+
+    #[test]
+    fn cover_crop_rotation_and_background_flatten_work_end_to_end() {
+        use crate::domain::{FitMode, Gravity};
+
+        // 80x40 rotated 90 degrees becomes 40x80, then cover-cropped to 20x20.
+        let png = make_png(80, 40);
+        let spec = TransformSpec {
+            dimensions: TargetDimensions::new(
+                Some(Dimension::new(Axis::Width, 20, DEFAULT_MAX_DIMENSION).unwrap()),
+                Some(Dimension::new(Axis::Height, 20, DEFAULT_MAX_DIMENSION).unwrap()),
+            ),
+            format: OutputFormat::Png,
+            fit: FitMode::Cover,
+            gravity: Gravity::North,
+            rotation: Rotation::Deg90,
+            ..TransformSpec::default()
+        };
+        let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
+        assert_eq!(out.source_dimensions, ImageDimensions::new(40, 80).unwrap());
+        assert_eq!(out.output_dimensions, ImageDimensions::new(20, 20).unwrap());
+
+        // Transparent 16x16 PNG flattened onto pure white JPEG should decode near white.
+        let transparent = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0]));
+        let mut transparent_png = Vec::new();
+        DynamicImage::ImageRgba8(transparent)
+            .write_to(&mut Cursor::new(&mut transparent_png), ImageFormat::Png)
+            .unwrap();
+
+        let flat_spec = TransformSpec {
+            format: OutputFormat::Jpeg,
+            quality: Quality::new(95).unwrap(),
+            background: Some("ffffff".parse().unwrap()),
+            ..TransformSpec::default()
+        };
+        let flat = transform(&transparent_png, &flat_spec, &EngineLimits::default()).unwrap();
+        let decoded = ImageReader::new(Cursor::new(&flat.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let pixel = decoded.get_pixel(8, 8).0;
+        assert!(pixel[0] >= 250 && pixel[1] >= 250 && pixel[2] >= 250);
     }
 }

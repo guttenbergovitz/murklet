@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::domain::{Axis, Dimension, OutputFormat, Quality, ResizeFilter};
+use crate::domain::{
+    Axis, BackgroundColour, Dimension, Dpr, FitMode, Gravity, OutputFormat, Quality, ResizeFilter,
+    Rotation,
+};
 use crate::policy::error::PolicyError;
 
 /// Raw TOML configuration for a single named preset (`[presets.<name>]`).
@@ -21,14 +24,24 @@ pub struct PresetConfig {
     pub format: Option<String>,
     /// Optional resampling filter.
     pub filter: Option<String>,
+    /// Optional fit mode (`fill`, `contain`, `cover`, `scale-down`).
+    pub fit: Option<String>,
+    /// Optional crop gravity or focal point (`center`, `north`, `fp:0.5:0.2`, etc.).
+    pub gravity: Option<String>,
+    /// Optional clockwise rotation (`0`, `90`, `180`, `270`).
+    pub rotate: Option<u16>,
+    /// Optional device pixel ratio (`"1.0"`..=`"3.0"`).
+    pub dpr: Option<String>,
+    /// Optional RGB hex background colour for alpha flattening (for example `"ffffff"`).
+    pub bg: Option<String>,
 }
 
 /// A validated named preset whose fields already uphold all domain invariants.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ValidatedPreset {
-    /// Optional target width.
+    /// Optional target width (pre-DPR).
     pub width: Option<Dimension>,
-    /// Optional target height.
+    /// Optional target height (pre-DPR).
     pub height: Option<Dimension>,
     /// Optional lossy quality.
     pub quality: Option<Quality>,
@@ -36,6 +49,16 @@ pub struct ValidatedPreset {
     pub format: Option<OutputFormat>,
     /// Optional resampling filter.
     pub filter: Option<ResizeFilter>,
+    /// Optional fit mode.
+    pub fit: Option<FitMode>,
+    /// Optional crop gravity.
+    pub gravity: Option<Gravity>,
+    /// Optional rotation.
+    pub rotation: Option<Rotation>,
+    /// Optional device pixel ratio.
+    pub dpr: Option<Dpr>,
+    /// Optional RGB background colour.
+    pub background: Option<BackgroundColour>,
 }
 
 /// Immutable registry of validated named presets.
@@ -103,6 +126,40 @@ impl PresetRegistry {
                 .transpose()
                 .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
 
+            let fit = cfg
+                .fit
+                .as_deref()
+                .map(str::parse::<FitMode>)
+                .transpose()
+                .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
+
+            let gravity = cfg
+                .gravity
+                .as_deref()
+                .map(str::parse::<Gravity>)
+                .transpose()
+                .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
+
+            let rotation = cfg
+                .rotate
+                .map(Rotation::from_degrees)
+                .transpose()
+                .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
+
+            let dpr = cfg
+                .dpr
+                .as_deref()
+                .map(str::parse::<Dpr>)
+                .transpose()
+                .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
+
+            let background = cfg
+                .bg
+                .as_deref()
+                .map(str::parse::<BackgroundColour>)
+                .transpose()
+                .map_err(|err| PolicyError::Validation(format!("preset '{name}': {err}")))?;
+
             presets.insert(
                 name.clone(),
                 ValidatedPreset {
@@ -111,6 +168,11 @@ impl PresetRegistry {
                     quality,
                     format,
                     filter,
+                    fit,
+                    gravity,
+                    rotation,
+                    dpr,
+                    background,
                 },
             );
         }
@@ -160,6 +222,7 @@ mod tests {
                 quality: Some(80),
                 format: Some("webp".to_owned()),
                 filter: Some("lanczos".to_owned()),
+                ..PresetConfig::default()
             },
         );
 

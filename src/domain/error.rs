@@ -54,6 +54,16 @@ pub enum DomainError {
     UnsupportedFormat(String),
     /// Requested resampling filter is not supported.
     UnsupportedFilter(String),
+    /// Requested fit mode is not supported.
+    UnsupportedFitMode(String),
+    /// Requested crop gravity or focal point is not supported.
+    UnsupportedGravity(String),
+    /// Requested rotation angle is not one of `0`, `90`, `180`, `270`.
+    UnsupportedRotation(u16),
+    /// Requested device pixel ratio is outside `1.0..=3.0` or malformed.
+    InvalidDpr(String),
+    /// Requested background colour is not valid 3- or 6-character RGB hex.
+    InvalidBackground(String),
 }
 
 impl fmt::Display for DomainError {
@@ -73,6 +83,21 @@ impl fmt::Display for DomainError {
             }
             Self::UnsupportedFilter(filter) => {
                 write!(f, "unsupported resize filter: '{filter}'")
+            }
+            Self::UnsupportedFitMode(mode) => {
+                write!(f, "unsupported fit mode: '{mode}'")
+            }
+            Self::UnsupportedGravity(gravity) => {
+                write!(f, "unsupported gravity: '{gravity}'")
+            }
+            Self::UnsupportedRotation(degrees) => {
+                write!(f, "rotation must be 0, 90, 180, or 270, got {degrees}")
+            }
+            Self::InvalidDpr(raw) => {
+                write!(f, "dpr must be between 1.0 and 3.0, got '{raw}'")
+            }
+            Self::InvalidBackground(raw) => {
+                write!(f, "background must be 3- or 6-digit RGB hex, got '{raw}'")
             }
         }
     }

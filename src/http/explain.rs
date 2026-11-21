@@ -66,7 +66,7 @@ impl fmt::Display for ExplainReport {
                 writeln!(f, "Preset:    {}", preset.as_deref().unwrap_or("none"))?;
                 writeln!(
                     f,
-                    "Spec:      format={} quality={} width={} height={} filter={}",
+                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={}",
                     spec.format,
                     spec.quality.get(),
                     spec.dimensions
@@ -75,8 +75,15 @@ impl fmt::Display for ExplainReport {
                     spec.dimensions
                         .height()
                         .map_or_else(|| "auto".to_owned(), |d| d.get().to_string()),
+                    spec.fit,
+                    spec.gravity,
+                    spec.rotation,
                     spec.filter
                         .map_or_else(|| "auto".to_owned(), |flt| flt.to_string()),
+                    spec.background.map_or_else(
+                        || "none".to_owned(),
+                        crate::domain::BackgroundColour::to_hex
+                    ),
                 )?;
                 writeln!(f, "Canonical: {}", spec.canonical_representation())?;
                 writeln!(
@@ -230,6 +237,11 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "q" => out.q = Some(value.into_owned()),
             "f" => out.f = Some(value.into_owned()),
             "filter" => out.filter = Some(value.into_owned()),
+            "fit" => out.fit = Some(value.into_owned()),
+            "gravity" => out.gravity = Some(value.into_owned()),
+            "rotate" => out.rotate = Some(value.into_owned()),
+            "dpr" => out.dpr = Some(value.into_owned()),
+            "bg" => out.bg = Some(value.into_owned()),
             _ => {}
         }
     }

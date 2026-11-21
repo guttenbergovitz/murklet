@@ -44,6 +44,7 @@ fn bench_engine_transforms(c: &mut Criterion) {
         format: OutputFormat::Jpeg,
         quality: Quality::new(80).unwrap(),
         filter: Some(ResizeFilter::Lanczos),
+        ..TransformSpec::default()
     };
     group.bench_function("jpeg_lanczos", |b| {
         b.iter(|| transform(black_box(&source), black_box(&jpeg_lanczos), &limits).unwrap());

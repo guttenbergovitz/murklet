@@ -3,7 +3,8 @@
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, Dimension, OutputFormat, Quality, ResizeFilter, TargetDimensions, TransformSpec,
+    Axis, BackgroundColour, Dimension, Dpr, FitMode, Gravity, OutputFormat, Quality, ResizeFilter,
+    Rotation, TargetDimensions, TransformSpec,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -25,6 +26,16 @@ pub struct RawLoadQuery {
     pub f: Option<String>,
     /// Optional resampling filter (`nearest`, `box`, `linear`, `hermite`, `catmullrom`, `bspline`, `gaussian`, `lanczos`).
     pub filter: Option<String>,
+    /// Optional fit mode (`fill`, `contain`, `cover`, `scale-down`).
+    pub fit: Option<String>,
+    /// Optional crop gravity or focal point (`center`, `north`, `fp:0.5:0.2`, etc.).
+    pub gravity: Option<String>,
+    /// Optional clockwise rotation (`0`, `90`, `180`, `270`).
+    pub rotate: Option<String>,
+    /// Optional device pixel ratio (`1.0`..=`3.0`).
+    pub dpr: Option<String>,
+    /// Optional RGB hex background colour for alpha flattening (for example `ffffff`).
+    pub bg: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -82,10 +93,18 @@ pub fn parse_load_query_with_presets(
             }
         };
 
-    let width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?
+    let dpr = match raw.dpr.as_deref() {
+        None | Some("") => preset_defaults.dpr.unwrap_or_default(),
+        Some(value) => value.parse::<Dpr>()?,
+    };
+
+    let base_width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?
         .or(preset_defaults.width);
-    let height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?
+    let base_height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?
         .or(preset_defaults.height);
+
+    let width = apply_dpr_to_dimension(base_width, dpr, Axis::Width, max_dimension)?;
+    let height = apply_dpr_to_dimension(base_height, dpr, Axis::Height, max_dimension)?;
 
     let quality = match raw.q.as_deref() {
         None | Some("") => preset_defaults.quality.unwrap_or_default(),
@@ -112,6 +131,33 @@ pub fn parse_load_query_with_presets(
         Some(value) => Some(value.parse::<ResizeFilter>()?),
     };
 
+    let fit = match raw.fit.as_deref() {
+        None | Some("") => preset_defaults.fit.unwrap_or_default(),
+        Some(value) => value.parse::<FitMode>()?,
+    };
+
+    let gravity = match raw.gravity.as_deref() {
+        None | Some("") => preset_defaults.gravity.unwrap_or_default(),
+        Some(value) => value.parse::<Gravity>()?,
+    };
+
+    let rotation = match raw.rotate.as_deref() {
+        None | Some("") => preset_defaults.rotation.unwrap_or_default(),
+        Some(value) => {
+            let degrees = value.parse::<u16>().map_err(|_| {
+                HttpError::BadRequest(format!(
+                    "query parameter 'rotate' must be 0, 90, 180, or 270, got '{value}'"
+                ))
+            })?;
+            Rotation::from_degrees(degrees)?
+        }
+    };
+
+    let background = match raw.bg.as_deref() {
+        None | Some("") => preset_defaults.background,
+        Some(value) => Some(value.parse::<BackgroundColour>()?),
+    };
+
     Ok(ParsedLoadRequest {
         source,
         preset: preset_name,
@@ -120,9 +166,29 @@ pub fn parse_load_query_with_presets(
             format,
             quality,
             filter,
+            fit,
+            gravity,
+            rotation,
+            background,
         },
         explicit_format,
     })
+}
+
+fn apply_dpr_to_dimension(
+    dim: Option<Dimension>,
+    dpr: Dpr,
+    axis: Axis,
+    max_dimension: u32,
+) -> Result<Option<Dimension>, HttpError> {
+    let Some(base) = dim else {
+        return Ok(None);
+    };
+    if dpr == Dpr::ONE {
+        return Ok(Some(base));
+    }
+    let scaled = dpr.scale_dimension(base.get());
+    Ok(Some(Dimension::new(axis, scaled, max_dimension)?))
 }
 
 fn parse_optional_dimension(
@@ -163,6 +229,7 @@ mod tests {
                 q: Some("85".to_owned()),
                 f: Some("WebP".to_owned()),
                 filter: Some("lanczos".to_owned()),
+                ..RawLoadQuery::default()
             },
             DEFAULT_MAX_DIMENSION,
         )

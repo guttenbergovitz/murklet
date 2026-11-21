@@ -8,6 +8,7 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use crate::domain::error::{Axis, DomainError};
+use crate::domain::geometry::{BackgroundColour, FitMode, Gravity, Rotation};
 
 /// Default maximum width or height accepted by baseline transformation requests.
 pub const DEFAULT_MAX_DIMENSION: u32 = 8192;
@@ -71,6 +72,12 @@ impl ImageDimensions {
             .ok_or(DomainError::ZeroSourceDimension { axis: Axis::Height })?;
 
         Ok(Self { width, height })
+    }
+
+    /// Constructs concrete image dimensions from already-validated [`NonZeroU32`] axes.
+    #[must_use]
+    pub const fn from_non_zero(width: NonZeroU32, height: NonZeroU32) -> Self {
+        Self { width, height }
     }
 
     /// Returns the image width in pixels.
@@ -398,6 +405,14 @@ pub struct TransformSpec {
     pub quality: Quality,
     /// Explicit resampling filter, or `None` for automatic selection.
     pub filter: Option<ResizeFilter>,
+    /// Fit/crop strategy when target dimensions are provided.
+    pub fit: FitMode,
+    /// Crop anchor or focal point (meaningful when `fit == FitMode::Cover`).
+    pub gravity: Gravity,
+    /// Clockwise lossless rotation (`0`, `90`, `180`, `270`).
+    pub rotation: Rotation,
+    /// Optional RGB background colour used to flatten alpha on opaque outputs (such as JPEG).
+    pub background: Option<BackgroundColour>,
 }
 
 impl TransformSpec {
@@ -408,7 +423,7 @@ impl TransformSpec {
     /// making it suitable as input to cache-key hashing.
     #[must_use]
     pub fn canonical_representation(&self) -> String {
-        let mut out = String::with_capacity(48);
+        let mut out = String::with_capacity(64);
         out.push('v');
         out.push_str(&CANONICAL_SPEC_VERSION.to_string());
         out.push_str("|f=");
@@ -433,6 +448,22 @@ impl TransformSpec {
         match self.filter {
             Some(filter) => out.push_str(filter.as_str()),
             None => out.push_str("auto"),
+        }
+        if self.fit != FitMode::Fill {
+            out.push_str("|fit=");
+            out.push_str(self.fit.as_str());
+        }
+        if self.fit == FitMode::Cover && self.gravity != Gravity::Center {
+            out.push_str("|g=");
+            out.push_str(&self.gravity.canonical_str());
+        }
+        if self.rotation != Rotation::Deg0 {
+            out.push_str("|rot=");
+            out.push_str(&self.rotation.degrees().to_string());
+        }
+        if let Some(bg) = self.background {
+            out.push_str("|bg=");
+            out.push_str(&bg.to_hex());
         }
         out
     }
@@ -627,6 +658,7 @@ mod tests {
             format: OutputFormat::Png,
             quality: Quality::new(20).unwrap(),
             filter: None,
+            ..TransformSpec::default()
         };
         let png_high_q = TransformSpec {
             quality: Quality::new(95).unwrap(),
@@ -650,6 +682,7 @@ mod tests {
             format: "jpg".parse().unwrap(),
             quality: Quality::DEFAULT,
             filter: Some(ResizeFilter::Lanczos),
+            ..TransformSpec::default()
         };
         assert_eq!(
             jpeg_spec.canonical_representation(),
