@@ -1,0 +1,23 @@
+[package]
+name = "murklet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Image proxy and on-demand image transformation service."
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+clone_on_ref_ptr = "deny"
