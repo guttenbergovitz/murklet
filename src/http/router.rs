@@ -1,4 +1,4 @@
-//! Axum router and HTTP handlers wiring domain, origin, engine, and cache layers.
+//! Axum router and HTTP handlers wiring domain, origins, engine, and cache layers.
 
 use std::sync::Arc;
 
@@ -11,23 +11,37 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
-use crate::cache::{CacheKey, FsCache, compute_etag};
-use crate::domain::DEFAULT_MAX_DIMENSION;
+use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag};
+use crate::domain::{DEFAULT_MAX_DIMENSION, TransformSpec};
 use crate::engine::{self, EngineLimits, TransformOutput};
 use crate::http::error::HttpError;
 use crate::http::query::{RawLoadQuery, parse_load_query};
-use crate::origin::LocalFsOrigin;
+use crate::origin::{HttpOrigin, LocalFsOrigin};
 
 /// Default `Cache-Control` header applied to served image variants.
 pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 const LOCAL_ORIGIN_ID: &str = "local";
+const HTTP_ORIGIN_ID: &str = "http";
+
+/// Shared output of a cache-miss fetch and transformation, wrapped in `Arc` so
+/// coalesced followers share encoded bytes without redundant copying.
+#[derive(Debug)]
+struct MissOutcome {
+    output: TransformOutput,
+    original_size: usize,
+    etag: String,
+}
+
+type VariantCoalescer = Coalescer<CacheKey, Result<Arc<MissOutcome>, HttpError>>;
 
 /// Shared immutable application state injected into HTTP handlers.
 #[derive(Debug, Clone)]
 pub struct AppState {
-    /// Local filesystem origin adapter.
-    pub origin: LocalFsOrigin,
+    /// Optional local filesystem origin adapter.
+    pub local_origin: Option<LocalFsOrigin>,
+    /// Optional HTTP(S) origin adapter (disabled by default unless configured with an allowlist).
+    pub http_origin: Option<HttpOrigin>,
     /// Filesystem-backed variant cache.
     pub cache: FsCache,
     /// Resource limits and animation fallback policy for the image engine.
@@ -41,21 +55,34 @@ pub struct AppState {
     pub cleanup_token: Option<String>,
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
+    coalescer: VariantCoalescer,
 }
 
 impl AppState {
-    /// Constructs application state with sensible baseline defaults.
+    /// Constructs application state backed by a local filesystem origin and cache.
+    ///
+    /// Remote HTTP(S) fetching is disabled by default; attach an allowlisted
+    /// [`HttpOrigin`] via [`Self::with_http_origin`] to enable it.
     #[must_use]
-    pub fn new(origin: LocalFsOrigin, cache: FsCache) -> Self {
+    pub fn new(local_origin: LocalFsOrigin, cache: FsCache) -> Self {
         Self {
-            origin,
+            local_origin: Some(local_origin),
+            http_origin: None,
             cache,
             engine_limits: EngineLimits::default(),
             max_target_dimension: DEFAULT_MAX_DIMENSION,
             cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
             cleanup_token: None,
             diagnostic_headers: false,
+            coalescer: Coalescer::new(),
         }
+    }
+
+    /// Attaches an allowlisted [`HttpOrigin`] for remote `http://` and `https://` requests.
+    #[must_use]
+    pub fn with_http_origin(mut self, http_origin: HttpOrigin) -> Self {
+        self.http_origin = Some(http_origin);
+        self
     }
 }
 
@@ -82,7 +109,24 @@ async fn load_handler(
     Query(raw_query): Query<RawLoadQuery>,
 ) -> Result<Response, HttpError> {
     let parsed = parse_load_query(raw_query, state.max_target_dimension)?;
-    let cache_key = CacheKey::from_parts(LOCAL_ORIGIN_ID, &parsed.source, &parsed.spec);
+    let is_remote = is_http_source(&parsed.source);
+    let origin_id = if is_remote {
+        if state.http_origin.is_none() {
+            return Err(HttpError::Forbidden(
+                "remote HTTP(S) origins are disabled".to_owned(),
+            ));
+        }
+        HTTP_ORIGIN_ID
+    } else {
+        if state.local_origin.is_none() {
+            return Err(HttpError::Forbidden(
+                "local filesystem origin is disabled".to_owned(),
+            ));
+        }
+        LOCAL_ORIGIN_ID
+    };
+
+    let cache_key = CacheKey::from_parts(origin_id, &parsed.source, &parsed.spec);
     let if_none_match = headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -116,70 +160,118 @@ async fn load_handler(
         ));
     }
 
-    // Cache miss: fetch from origin, transform via engine, and store atomically in cache.
-    let miss_result = {
-        let state = Arc::clone(&state);
-        let source = parsed.source;
-        let spec = parsed.spec;
-        let key = cache_key;
-        tokio::task::spawn_blocking(
-            move || -> Result<(TransformOutput, usize, String), HttpError> {
-                let fetched = state.origin.fetch(&source)?;
-                let original_size = fetched.bytes.len();
-                let output = engine::transform(&fetched.bytes, &spec, &state.engine_limits)?;
+    // Cache miss: coalesce concurrent requests for the same canonical variant key.
+    let coalesced = state
+        .coalescer
+        .execute(cache_key.clone(), || {
+            let state = Arc::clone(&state);
+            let source = parsed.source.clone();
+            let spec = parsed.spec;
+            let key = cache_key.clone();
+            async move {
+                fetch_transform_and_cache(state, origin_id, is_remote, source, spec, key).await
+            }
+        })
+        .await;
 
-                // Store transformed bytes under a key matching the actual output format
-                // (relevant if an animated source was passed through in its original format).
-                let effective_key = if output.format == key.format() {
-                    key
-                } else {
-                    let mut effective_spec = spec;
-                    effective_spec.format = output.format;
-                    CacheKey::from_parts(LOCAL_ORIGIN_ID, &source, &effective_spec)
-                };
-
-                let etag = match state.cache.put(&effective_key, &output.bytes) {
-                    Ok(stored) => stored.etag,
-                    Err(_) => compute_etag(&output.bytes),
-                };
-
-                Ok((output, original_size, etag))
-            },
-        )
-        .await
-        .map_err(|_| HttpError::Internal)??
+    let outcome = coalesced.value?;
+    let x_cache = if coalesced.was_coalesced {
+        "HIT"
+    } else {
+        "MISS"
     };
 
-    let (output, original_size, etag) = miss_result;
-
-    if etag_matches(if_none_match.as_deref(), &etag) {
+    if etag_matches(if_none_match.as_deref(), &outcome.etag) {
         return Ok(build_not_modified_response(
-            &etag,
+            &outcome.etag,
             &state.cache_control,
-            "MISS",
+            x_cache,
         ));
     }
 
-    let diagnostics = state.diagnostic_headers.then(|| DiagnosticMeta {
-        original_width: output.source_dimensions.width(),
-        original_height: output.source_dimensions.height(),
-        processed_width: output.output_dimensions.width(),
-        processed_height: output.output_dimensions.height(),
-        original_size,
-        processed_size: output.bytes.len(),
-        format: output.format.as_str(),
-        quality: parsed.spec.quality.get(),
-        filter: output.filter.to_string(),
-    });
+    let diagnostics =
+        (!coalesced.was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
+            original_width: outcome.output.source_dimensions.width(),
+            original_height: outcome.output.source_dimensions.height(),
+            processed_width: outcome.output.output_dimensions.width(),
+            processed_height: outcome.output.output_dimensions.height(),
+            original_size: outcome.original_size,
+            processed_size: outcome.output.bytes.len(),
+            format: outcome.output.format.as_str(),
+            quality: parsed.spec.quality.get(),
+            filter: outcome.output.filter.to_string(),
+        });
 
     Ok(build_image_response(
-        output.bytes,
-        output.format.mime_type(),
-        &etag,
+        outcome.output.bytes.clone(),
+        outcome.output.format.mime_type(),
+        &outcome.etag,
         &state.cache_control,
-        "MISS",
+        x_cache,
         diagnostics.as_ref(),
     ))
+}
+
+async fn fetch_transform_and_cache(
+    state: Arc<AppState>,
+    origin_id: &'static str,
+    is_remote: bool,
+    source: String,
+    spec: TransformSpec,
+    key: CacheKey,
+) -> Result<Arc<MissOutcome>, HttpError> {
+    let fetched = if is_remote {
+        let http_origin = state.http_origin.as_ref().ok_or_else(|| {
+            HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
+        })?;
+        http_origin.fetch(&source).await?
+    } else {
+        let local_origin = state.local_origin.clone().ok_or_else(|| {
+            HttpError::Forbidden("local filesystem origin is disabled".to_owned())
+        })?;
+        let source_for_fs = source.clone();
+        tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
+            .await
+            .map_err(|_| HttpError::Internal)??
+    };
+
+    let original_size = fetched.bytes.len();
+
+    tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
+        let output = engine::transform(&fetched.bytes, &spec, &state.engine_limits)?;
+
+        // Store transformed bytes under a key matching the actual output format
+        // (relevant if an animated source was passed through in its original format).
+        let effective_key = if output.format == key.format() {
+            key
+        } else {
+            let mut effective_spec = spec;
+            effective_spec.format = output.format;
+            CacheKey::from_parts(origin_id, &source, &effective_spec)
+        };
+
+        let etag = match state.cache.put(&effective_key, &output.bytes) {
+            Ok(stored) => stored.etag,
+            Err(_) => compute_etag(&output.bytes),
+        };
+
+        Ok(Arc::new(MissOutcome {
+            output,
+            original_size,
+            etag,
+        }))
+    })
+    .await
+    .map_err(|_| HttpError::Internal)?
+}
+
+fn is_http_source(source: &str) -> bool {
+    source
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || source
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -343,6 +435,7 @@ fn constant_time_token_eq(supplied: &str, expected: &str) -> bool {
     bool::from(a.ct_eq(b))
 }
 
+// Display-only percentage formatting; precision loss only occurs above 2^53 bytes.
 #[allow(clippy::cast_precision_loss)]
 fn format_size_reduction(original_size: usize, processed_size: usize) -> String {
     if original_size == 0 {
@@ -516,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_maps_validation_traversal_and_missing_files_cleanly() {
+    async fn load_maps_validation_traversal_missing_and_disabled_remote_origins() {
         let fixture = TestFixture::new("errors");
         let app = build_router(Arc::new(fixture.state()));
 
@@ -525,6 +618,7 @@ mod tests {
             ("/load?url=sample.png&w=abc", StatusCode::BAD_REQUEST),
             ("/load?url=../secret.png", StatusCode::BAD_REQUEST),
             ("/load?url=missing.png", StatusCode::NOT_FOUND),
+            ("/load?url=https://example.com/a.png", StatusCode::FORBIDDEN),
             (
                 "/load?url=sample.png&f=avif",
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,

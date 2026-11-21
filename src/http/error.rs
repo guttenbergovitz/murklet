@@ -12,7 +12,7 @@ use crate::engine::EngineError;
 use crate::origin::OriginError;
 
 /// Transport-level error converted into an HTTP status code and plain-text message.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HttpError {
     /// Request query or parameters failed validation (`400 Bad Request`).
     BadRequest(String),

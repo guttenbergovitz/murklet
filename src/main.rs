@@ -8,7 +8,7 @@ use std::sync::Arc;
 use murklet::cache::FsCache;
 use murklet::engine::DEFAULT_MAX_INPUT_BYTES;
 use murklet::http::{AppState, build_router};
-use murklet::origin::LocalFsOrigin;
+use murklet::origin::{HostAllowlist, HttpOrigin, HttpOriginConfig, LocalFsOrigin};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9876";
 const DEFAULT_ORIGIN_DIR: &str = "./assets";
@@ -37,6 +37,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cache = FsCache::new(&cache_dir, DEFAULT_MAX_INPUT_BYTES)?;
 
     let mut state = AppState::new(origin, cache);
+
+    if let Ok(raw_hosts) = env::var("MURKLET_ALLOWED_HOSTS") {
+        let allowlist = HostAllowlist::new(raw_hosts.split(','));
+        if !allowlist.is_empty() {
+            let http_origin =
+                HttpOrigin::new(HttpOriginConfig::new(allowlist, DEFAULT_MAX_INPUT_BYTES))?;
+            state = state.with_http_origin(http_origin);
+        }
+    }
+
     state.cleanup_token = env::var("MURKLET_CLEANUP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty());
