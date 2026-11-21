@@ -10,6 +10,7 @@ Instructions for AI coding agents working in the Murklet repository.
 ## Spec-driven workflow and repository hygiene
 
 - Temporary working specifications, design scratchpads, and agent plans must live exclusively under `.specs/` (which is gitignored). Never scatter temporary markdown plans, notes, or checklists across the repository.
+- Canonical project skills live under `.agents/skills/` (`murklet-feature-slice`, `murklet-architecture-review`, `murklet-security-audit`). Use them when implementing features, reviewing changes, or auditing security boundaries.
 - Durable architectural decisions belong in `docs/adr/` following the minimal format in `docs/adr/README.md`. Keep ADRs short and factual — no invented teams, rollout dates, or process theatre.
 - Work in small, verifiable steps. Do not introduce speculative abstractions, unused traits, or unrequested dependencies.
 
