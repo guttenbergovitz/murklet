@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use murklet::cache::FsCache;
 use murklet::engine::WatermarkRegistry;
-use murklet::http::{AppState, build_router, explain_load_request};
+use murklet::http::{
+    AppState, PolicyTestSuite, build_router, explain_load_request, run_policy_test_suite,
+};
 use murklet::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 use murklet::policy::{LogFormatConfig, MurkletConfig};
 use tracing_subscriber::EnvFilter;
@@ -29,6 +31,10 @@ enum CliCommand {
     },
     Sign {
         target: String,
+        config_path: PathBuf,
+    },
+    TestPolicy {
+        suite_path: PathBuf,
         config_path: PathBuf,
     },
 }
@@ -87,6 +93,20 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             };
             println!("{}", signer.sign_load_url(&target));
             Ok(ExitCode::SUCCESS)
+        }
+        CliCommand::TestPolicy {
+            suite_path,
+            config_path,
+        } => {
+            let config = MurkletConfig::from_file(&config_path)?;
+            let suite = PolicyTestSuite::from_file(&suite_path)?;
+            let report = run_policy_test_suite(&config, &suite);
+            println!("{report}");
+            if report.all_passed() {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
         }
         CliCommand::Serve { config_path } => {
             let config = MurkletConfig::from_file(&config_path)?;
@@ -262,6 +282,11 @@ fn parse_cli_args() -> Result<CliCommand, String> {
         return parse_sign_args(args);
     }
 
+    if args.peek().is_some_and(|arg| arg == "test-policy") {
+        let _ = args.next();
+        return parse_test_policy_args(args);
+    }
+
     let mut check_only = false;
     let mut explicit_path: Option<PathBuf> = None;
 
@@ -270,7 +295,7 @@ fn parse_cli_args() -> Result<CliCommand, String> {
             check_only = true;
         } else if arg.starts_with('-') {
             return Err(format!(
-                "unrecognised flag '{arg}' (supported: --check, explain <url> [config], sign <url> [config])"
+                "unrecognised flag '{arg}' (supported: --check, explain <url> [config], sign <url> [config], test-policy <suite> [config])"
             ));
         } else if explicit_path.is_none() {
             explicit_path = Some(PathBuf::from(arg));
@@ -343,6 +368,31 @@ fn parse_sign_args(args: impl Iterator<Item = String>) -> Result<CliCommand, Str
 
     Ok(CliCommand::Sign {
         target,
+        config_path: resolve_config_path(explicit_path),
+    })
+}
+
+fn parse_test_policy_args(args: impl Iterator<Item = String>) -> Result<CliCommand, String> {
+    let mut suite_path: Option<PathBuf> = None;
+    let mut explicit_path: Option<PathBuf> = None;
+
+    for arg in args {
+        if arg.starts_with('-') {
+            return Err(format!("unrecognised flag '{arg}' for test-policy"));
+        } else if suite_path.is_none() {
+            suite_path = Some(PathBuf::from(arg));
+        } else if explicit_path.is_none() {
+            explicit_path = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unexpected extra argument '{arg}'"));
+        }
+    }
+
+    let suite_path = suite_path
+        .ok_or_else(|| "usage: murklet test-policy <suite.toml> [config.toml]".to_owned())?;
+
+    Ok(CliCommand::TestPolicy {
+        suite_path,
         config_path: resolve_config_path(explicit_path),
     })
 }
