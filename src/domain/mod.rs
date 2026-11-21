@@ -9,7 +9,10 @@ pub mod geometry;
 pub mod transform;
 
 pub use error::{Axis, DomainError};
-pub use filters::{BlurSigma, Brightness, Contrast, Flip, ImageFilters, SharpenSigma};
+pub use filters::{
+    BlurSigma, Brightness, Contrast, Flip, Gamma, Hue, ImageFilters, Saturation, Sepia,
+    SharpenSigma,
+};
 pub use geometry::{
     BackgroundColour, CropRect, Dpr, FitMode, Gravity, ResizePlan, Rotation, plan_resize,
 };

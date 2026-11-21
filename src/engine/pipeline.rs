@@ -307,8 +307,23 @@ fn apply_pixel_filters(mut image: DynamicImage, filters: &ImageFilters) -> Dynam
     if filters.contrast.get() != 0 {
         image = image.adjust_contrast(f32::from(filters.contrast.get()));
     }
+    if filters.saturation.get() != 0 {
+        image = apply_saturation(image, filters.saturation.get());
+    }
+    if filters.hue.degrees() != 0 {
+        image = image.huerotate(i32::from(filters.hue.degrees()));
+    }
+    if !filters.gamma.is_identity() {
+        image = apply_gamma(image, filters.gamma.as_f32());
+    }
     if filters.grayscale {
         image = image.grayscale();
+    }
+    if filters.sepia.get() != 0 {
+        image = apply_sepia(image, filters.sepia.get());
+    }
+    if let Some(tint) = filters.tint {
+        image = apply_monochrome_tint(image, tint);
     }
     if filters.invert {
         image.invert();
@@ -320,6 +335,104 @@ fn apply_pixel_filters(mut image: DynamicImage, filters: &ImageFilters) -> Dynam
         image = image.unsharpen(sharpen.as_f32(), 1);
     }
     image
+}
+
+/// Applies a per-pixel RGB transform while preserving any alpha channel intact.
+fn map_rgb_pixels<F>(image: DynamicImage, mut op: F) -> DynamicImage
+where
+    F: FnMut([u8; 3]) -> [u8; 3],
+{
+    if image.color().has_alpha() {
+        let mut rgba = image.into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            let [r, g, b] = op([pixel.0[0], pixel.0[1], pixel.0[2]]);
+            pixel.0[0] = r;
+            pixel.0[1] = g;
+            pixel.0[2] = b;
+        }
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = image.into_rgb8();
+        for pixel in rgb.pixels_mut() {
+            pixel.0 = op(pixel.0);
+        }
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_f32_to_u8(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+/// Adjusts saturation around Rec.709 luminance (`-100` = greyscale, `0` = identity, `+100` = 2×).
+fn apply_saturation(image: DynamicImage, amount: i8) -> DynamicImage {
+    let factor = 1.0 + f32::from(amount) / 100.0;
+    map_rgb_pixels(image, |[r, g, b]| {
+        let rf = f32::from(r);
+        let gf = f32::from(g);
+        let bf = f32::from(b);
+        let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+        [
+            clamp_f32_to_u8(luma + (rf - luma) * factor),
+            clamp_f32_to_u8(luma + (gf - luma) * factor),
+            clamp_f32_to_u8(luma + (bf - luma) * factor),
+        ]
+    })
+}
+
+/// Applies tonal gamma correction via a precomputed 256-byte lookup table (`> 1.0` brightens midtones).
+fn apply_gamma(image: DynamicImage, gamma: f32) -> DynamicImage {
+    let inv_gamma = 1.0 / gamma;
+    let mut lut = [0_u8; 256];
+    for (idx, slot) in lut.iter_mut().enumerate() {
+        let norm = f32::from(u8::try_from(idx).unwrap_or(255)) / 255.0;
+        *slot = clamp_f32_to_u8(norm.powf(inv_gamma) * 255.0);
+    }
+    map_rgb_pixels(image, |[r, g, b]| {
+        [
+            lut[usize::from(r)],
+            lut[usize::from(g)],
+            lut[usize::from(b)],
+        ]
+    })
+}
+
+/// Applies a vintage sepia matrix blended linearly with the original pixel by `amount` (`0..=100`).
+fn apply_sepia(image: DynamicImage, amount: u8) -> DynamicImage {
+    let strength = f32::from(amount) / 100.0;
+    map_rgb_pixels(image, |[r, g, b]| {
+        let rf = f32::from(r);
+        let gf = f32::from(g);
+        let bf = f32::from(b);
+        let sr = (0.393 * rf + 0.769 * gf + 0.189 * bf).min(255.0);
+        let sg = (0.349 * rf + 0.686 * gf + 0.168 * bf).min(255.0);
+        let sb = (0.272 * rf + 0.534 * gf + 0.131 * bf).min(255.0);
+        [
+            clamp_f32_to_u8(rf + (sr - rf) * strength),
+            clamp_f32_to_u8(gf + (sg - gf) * strength),
+            clamp_f32_to_u8(bf + (sb - bf) * strength),
+        ]
+    })
+}
+
+/// Converts any image into a brand monochrome duotone (`black -> tint -> white`)
+/// driven by Rec.709 luminance while keeping shadows crisp, highlights clean, and alpha intact.
+fn apply_monochrome_tint(image: DynamicImage, tint: BackgroundColour) -> DynamicImage {
+    map_rgb_pixels(image, |[r, g, b]| {
+        // Exact 8-bit Rec.709 luminance (54 + 183 + 19 = 256).
+        let luma = (54 * u32::from(r) + 183 * u32::from(g) + 19 * u32::from(b) + 128) >> 8;
+        let ramp = |base: u8| -> u8 {
+            let base_u32 = u32::from(base);
+            let out = if luma <= 128 {
+                (base_u32 * luma + 64) / 128
+            } else {
+                base_u32 + ((255 - base_u32) * (luma - 128) + 63) / 127
+            };
+            u8::try_from(out).unwrap_or(255)
+        };
+        [ramp(tint.r), ramp(tint.g), ramp(tint.b)]
+    })
 }
 
 /// Composites an alpha-bearing image over a solid RGB background colour using
@@ -708,5 +821,85 @@ mod tests {
         let px = gs_img.get_pixel(8, 8).0;
         assert_eq!(px[0], px[1]);
         assert_eq!(px[1], px[2]);
+    }
+
+    #[test]
+    fn monochrome_tint_maps_shadows_midtones_highlights_and_preserves_alpha() {
+        // 3x1 RGBA strip: pure black, exact mid-grey, pure white — all with alpha=180.
+        let mut strip = RgbaImage::new(3, 1);
+        strip.put_pixel(0, 0, Rgba([0, 0, 0, 180]));
+        strip.put_pixel(1, 0, Rgba([128, 128, 128, 180]));
+        strip.put_pixel(2, 0, Rgba([255, 255, 255, 180]));
+        let mut strip_png = Vec::new();
+        DynamicImage::ImageRgba8(strip)
+            .write_to(&mut Cursor::new(&mut strip_png), ImageFormat::Png)
+            .unwrap();
+
+        let brand: BackgroundColour = "1a73e8".parse().unwrap();
+        let spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                tint: Some(brand),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let out = transform(&strip_png, &spec, &EngineLimits::default()).unwrap();
+        let decoded = ImageReader::new(Cursor::new(&out.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgba8();
+
+        // Shadows stay black, midtones hit exact brand colour, highlights stay white; alpha intact.
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 180]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0x1a, 0x73, 0xe8, 180]);
+        assert_eq!(decoded.get_pixel(2, 0).0, [255, 255, 255, 180]);
+    }
+
+    #[test]
+    fn saturation_gamma_hue_and_sepia_transform_pixels_cleanly() {
+        use crate::domain::{Gamma, Hue, Saturation, Sepia};
+
+        let solid = RgbaImage::from_pixel(8, 8, Rgba([200, 100, 50, 255]));
+        let mut solid_png = Vec::new();
+        DynamicImage::ImageRgba8(solid)
+            .write_to(&mut Cursor::new(&mut solid_png), ImageFormat::Png)
+            .unwrap();
+
+        // Saturation -100 produces equal R=G=B channels.
+        let desat_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                saturation: Saturation::new(-100).unwrap(),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let desat = transform(&solid_png, &desat_spec, &EngineLimits::default()).unwrap();
+        let desat_img = ImageReader::new(Cursor::new(&desat.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let px = desat_img.get_pixel(4, 4).0;
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+
+        // Gamma 2.0 brightens midtones; hue + sepia execute cleanly without panics.
+        let combo_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                gamma: "2.0".parse::<Gamma>().unwrap(),
+                hue: Hue::new(90).unwrap(),
+                sepia: Sepia::new(75).unwrap(),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let combo = transform(&solid_png, &combo_spec, &EngineLimits::default()).unwrap();
+        assert!(!combo.bytes.is_empty());
     }
 }

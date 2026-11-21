@@ -3,9 +3,9 @@
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, Dpr, FitMode, Flip,
-    Gravity, ImageFilters, OutputFormat, Quality, ResizeFilter, Rotation, SharpenSigma,
-    TargetDimensions, TransformSpec,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
+    Flip, Gamma, Gravity, Hue, ImageFilters, OutputFormat, Quality, ResizeFilter, Rotation,
+    Saturation, Sepia, SharpenSigma, TargetDimensions, TransformSpec,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -53,6 +53,17 @@ pub struct RawLoadQuery {
     pub brightness: Option<String>,
     /// Optional contrast adjustment (`-100..=100`).
     pub contrast: Option<String>,
+    /// Optional saturation adjustment (`-100..=100`).
+    pub saturation: Option<String>,
+    /// Optional hue rotation (`-360..=360`).
+    pub hue: Option<String>,
+    /// Optional tonal gamma (`0.2..=5.0`).
+    pub gamma: Option<String>,
+    /// Optional sepia intensity (`0..=100`, or `true`/`false`).
+    pub sepia: Option<String>,
+    /// Optional brand monochrome tint colour (3- or 6-digit RGB hex).
+    #[serde(alias = "mono", alias = "monochrome")]
+    pub tint: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -203,49 +214,60 @@ fn parse_image_filters(
         None | Some("") => preset.flip.unwrap_or_default(),
         Some(value) => value.parse::<Flip>()?,
     };
-
     let grayscale = match raw.grayscale.as_deref() {
         None | Some("") => preset.grayscale.unwrap_or(false),
         Some(value) => parse_bool_param("grayscale", value)?,
     };
-
     let invert = match raw.invert.as_deref() {
         None | Some("") => preset.invert.unwrap_or(false),
         Some(value) => parse_bool_param("invert", value)?,
     };
-
     let blur = match raw.blur.as_deref() {
         None | Some("") => preset.blur,
         Some(value) => Some(value.parse::<BlurSigma>()?),
     };
-
     let sharpen = match raw.sharpen.as_deref() {
         None | Some("") => preset.sharpen,
         Some(value) => Some(value.parse::<SharpenSigma>()?),
     };
-
     let brightness = match raw.brightness.as_deref() {
         None | Some("") => preset.brightness.unwrap_or_default(),
-        Some(value) => {
-            let parsed = value.parse::<i16>().map_err(|_| {
-                HttpError::BadRequest(format!(
-                    "query parameter 'brightness' must be an integer between -100 and 100, got '{value}'"
-                ))
-            })?;
-            Brightness::new(parsed)?
-        }
+        Some(value) => Brightness::new(parse_signed_param("brightness", value, -100, 100)?)?,
     };
-
     let contrast = match raw.contrast.as_deref() {
         None | Some("") => preset.contrast.unwrap_or_default(),
+        Some(value) => Contrast::new(parse_signed_param("contrast", value, -100, 100)?)?,
+    };
+    let saturation = match raw.saturation.as_deref() {
+        None | Some("") => preset.saturation.unwrap_or_default(),
+        Some(value) => Saturation::new(parse_signed_param("saturation", value, -100, 100)?)?,
+    };
+    let hue = match raw.hue.as_deref() {
+        None | Some("") => preset.hue.unwrap_or_default(),
         Some(value) => {
-            let parsed = value.parse::<i16>().map_err(|_| {
+            let parsed = value.parse::<i32>().map_err(|_| {
                 HttpError::BadRequest(format!(
-                    "query parameter 'contrast' must be an integer between -100 and 100, got '{value}'"
+                    "query parameter 'hue' must be an integer between -360 and 360, got '{value}'"
                 ))
             })?;
-            Contrast::new(parsed)?
+            Hue::new(parsed)?
         }
+    };
+    let gamma = match raw.gamma.as_deref() {
+        None | Some("") => preset.gamma.unwrap_or_default(),
+        Some(value) => value.parse::<Gamma>()?,
+    };
+    let sepia = match raw.sepia.as_deref() {
+        None | Some("") => preset.sepia.unwrap_or_default(),
+        Some(value) => value.parse::<Sepia>()?,
+    };
+    let tint = match raw.tint.as_deref() {
+        None | Some("") => preset.tint,
+        Some(value) => Some(
+            value
+                .parse::<BackgroundColour>()
+                .map_err(|_| DomainError::InvalidTint(value.to_owned()))?,
+        ),
     };
 
     Ok(ImageFilters {
@@ -256,6 +278,19 @@ fn parse_image_filters(
         sharpen,
         brightness,
         contrast,
+        saturation,
+        hue,
+        gamma,
+        sepia,
+        tint,
+    })
+}
+
+fn parse_signed_param(name: &str, raw: &str, min: i16, max: i16) -> Result<i16, HttpError> {
+    raw.parse::<i16>().map_err(|_| {
+        HttpError::BadRequest(format!(
+            "query parameter '{name}' must be an integer between {min} and {max}, got '{raw}'"
+        ))
     })
 }
 

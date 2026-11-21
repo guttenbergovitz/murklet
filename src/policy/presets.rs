@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, Dpr, FitMode, Flip,
-    Gravity, OutputFormat, Quality, ResizeFilter, Rotation, SharpenSigma,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
+    Flip, Gamma, Gravity, Hue, OutputFormat, Quality, ResizeFilter, Rotation, Saturation, Sepia,
+    SharpenSigma,
 };
 use crate::policy::error::PolicyError;
 
@@ -48,6 +49,17 @@ pub struct PresetConfig {
     pub brightness: Option<i16>,
     /// Optional contrast adjustment (`-100..=100`).
     pub contrast: Option<i16>,
+    /// Optional saturation adjustment (`-100..=100`).
+    pub saturation: Option<i16>,
+    /// Optional hue rotation (`-360..=360`).
+    pub hue: Option<i32>,
+    /// Optional tonal gamma (`"0.2"`..=`"5.0"`).
+    pub gamma: Option<String>,
+    /// Optional sepia intensity (`0..=100`).
+    pub sepia: Option<u8>,
+    /// Optional RGB hex brand monochrome tint colour (for example `"1a73e8"`).
+    #[serde(alias = "mono", alias = "monochrome")]
+    pub tint: Option<String>,
 }
 
 /// A validated named preset whose fields already uphold all domain invariants.
@@ -87,6 +99,16 @@ pub struct ValidatedPreset {
     pub brightness: Option<Brightness>,
     /// Optional contrast offset.
     pub contrast: Option<Contrast>,
+    /// Optional saturation offset.
+    pub saturation: Option<Saturation>,
+    /// Optional hue rotation.
+    pub hue: Option<Hue>,
+    /// Optional tonal gamma.
+    pub gamma: Option<Gamma>,
+    /// Optional sepia intensity.
+    pub sepia: Option<Sepia>,
+    /// Optional monochrome tint colour.
+    pub tint: Option<BackgroundColour>,
 }
 
 /// Immutable registry of validated named presets.
@@ -153,11 +175,9 @@ fn validate_single_preset(
         )));
     }
 
-    let wrap = |err: crate::domain::DomainError| {
-        PolicyError::Validation(format!("preset '{name}': {err}"))
-    };
+    let wrap = |err: DomainError| PolicyError::Validation(format!("preset '{name}': {err}"));
 
-    Ok(ValidatedPreset {
+    let mut preset = ValidatedPreset {
         width: cfg
             .width
             .map(|v| Dimension::new(Axis::Width, v, max_target_dimension))
@@ -210,33 +230,69 @@ fn validate_single_preset(
             .map(str::parse::<BackgroundColour>)
             .transpose()
             .map_err(wrap)?,
-        flip: cfg
-            .flip
-            .as_deref()
-            .map(str::parse::<Flip>)
-            .transpose()
-            .map_err(wrap)?,
-        grayscale: cfg.grayscale,
-        invert: cfg.invert,
-        blur: cfg
-            .blur
-            .as_deref()
-            .map(str::parse::<BlurSigma>)
-            .transpose()
-            .map_err(wrap)?,
-        sharpen: cfg
-            .sharpen
-            .as_deref()
-            .map(str::parse::<SharpenSigma>)
-            .transpose()
-            .map_err(wrap)?,
-        brightness: cfg
-            .brightness
-            .map(Brightness::new)
-            .transpose()
-            .map_err(wrap)?,
-        contrast: cfg.contrast.map(Contrast::new).transpose().map_err(wrap)?,
-    })
+        ..ValidatedPreset::default()
+    };
+
+    populate_preset_filters(name, cfg, &mut preset)?;
+    Ok(preset)
+}
+
+fn populate_preset_filters(
+    name: &str,
+    cfg: &PresetConfig,
+    preset: &mut ValidatedPreset,
+) -> Result<(), PolicyError> {
+    let wrap = |err: DomainError| PolicyError::Validation(format!("preset '{name}': {err}"));
+
+    preset.flip = cfg
+        .flip
+        .as_deref()
+        .map(str::parse::<Flip>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.grayscale = cfg.grayscale;
+    preset.invert = cfg.invert;
+    preset.blur = cfg
+        .blur
+        .as_deref()
+        .map(str::parse::<BlurSigma>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.sharpen = cfg
+        .sharpen
+        .as_deref()
+        .map(str::parse::<SharpenSigma>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.brightness = cfg
+        .brightness
+        .map(Brightness::new)
+        .transpose()
+        .map_err(wrap)?;
+    preset.contrast = cfg.contrast.map(Contrast::new).transpose().map_err(wrap)?;
+    preset.saturation = cfg
+        .saturation
+        .map(Saturation::new)
+        .transpose()
+        .map_err(wrap)?;
+    preset.hue = cfg.hue.map(Hue::new).transpose().map_err(wrap)?;
+    preset.gamma = cfg
+        .gamma
+        .as_deref()
+        .map(str::parse::<Gamma>)
+        .transpose()
+        .map_err(wrap)?;
+    preset.sepia = cfg.sepia.map(Sepia::new).transpose().map_err(wrap)?;
+    preset.tint = cfg
+        .tint
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<BackgroundColour>()
+                .map_err(|_| DomainError::InvalidTint(raw.to_owned()))
+        })
+        .transpose()
+        .map_err(wrap)?;
+    Ok(())
 }
 
 fn is_valid_preset_name(name: &str) -> bool {

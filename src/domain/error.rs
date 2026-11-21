@@ -74,6 +74,16 @@ pub enum DomainError {
     InvalidBrightness(i16),
     /// Requested contrast adjustment is outside `-100..=100`.
     InvalidContrast(i16),
+    /// Requested saturation adjustment is outside `-100..=100`.
+    InvalidSaturation(i16),
+    /// Requested hue rotation is outside `-360..=360`.
+    InvalidHue(i32),
+    /// Requested gamma value is outside `0.2..=5.0` or malformed.
+    InvalidGamma(String),
+    /// Requested sepia intensity is outside `0..=100` or malformed.
+    InvalidSepia(String),
+    /// Requested monochrome tint colour is not valid 3- or 6-character RGB hex.
+    InvalidTint(String),
 }
 
 impl fmt::Display for DomainError {
@@ -123,6 +133,24 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidContrast(val) => {
                 write!(f, "contrast must be between -100 and 100, got {val}")
+            }
+            Self::InvalidSaturation(val) => {
+                write!(f, "saturation must be between -100 and 100, got {val}")
+            }
+            Self::InvalidHue(val) => {
+                write!(f, "hue rotation must be between -360 and 360, got {val}")
+            }
+            Self::InvalidGamma(raw) => {
+                write!(f, "gamma must be between 0.2 and 5.0, got '{raw}'")
+            }
+            Self::InvalidSepia(raw) => {
+                write!(
+                    f,
+                    "sepia must be between 0 and 100 (or true/false), got '{raw}'"
+                )
+            }
+            Self::InvalidTint(raw) => {
+                write!(f, "tint must be 3- or 6-digit RGB hex, got '{raw}'")
             }
         }
     }

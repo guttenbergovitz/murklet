@@ -250,6 +250,11 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "sharpen" => out.sharpen = Some(value.into_owned()),
             "brightness" => out.brightness = Some(value.into_owned()),
             "contrast" => out.contrast = Some(value.into_owned()),
+            "saturation" => out.saturation = Some(value.into_owned()),
+            "hue" => out.hue = Some(value.into_owned()),
+            "gamma" => out.gamma = Some(value.into_owned()),
+            "sepia" => out.sepia = Some(value.into_owned()),
+            "tint" | "mono" | "monochrome" => out.tint = Some(value.into_owned()),
             _ => {}
         }
     }
