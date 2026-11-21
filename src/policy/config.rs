@@ -103,6 +103,9 @@ impl Default for ServerConfig {
     }
 }
 
+/// Default interval between background cache eviction sweeps (5 minutes).
+pub const DEFAULT_CACHE_SWEEP_INTERVAL_SECS: u64 = 300;
+
 /// Filesystem variant cache settings (`[cache]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +116,15 @@ pub struct CacheConfig {
     /// Maximum size of a single cached variant in bytes.
     #[serde(default = "default_max_input_bytes")]
     pub max_entry_bytes: usize,
+    /// Optional total disk budget in bytes; oldest entries are evicted when exceeded.
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+    /// Optional entry time-to-live in seconds; expired entries are evicted lazily and on sweeps.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// Interval in seconds between background eviction sweeps when `max_total_bytes` or `ttl_secs` is set.
+    #[serde(default = "default_cache_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
 }
 
 impl Default for CacheConfig {
@@ -120,6 +132,9 @@ impl Default for CacheConfig {
         Self {
             dir: default_cache_dir(),
             max_entry_bytes: default_max_input_bytes(),
+            max_total_bytes: None,
+            ttl_secs: None,
+            sweep_interval_secs: DEFAULT_CACHE_SWEEP_INTERVAL_SECS,
         }
     }
 }
@@ -481,6 +496,23 @@ impl MurkletConfig {
                 "cache.max_entry_bytes must be greater than zero".to_owned(),
             ));
         }
+        if let Some(max_total) = self.cache.max_total_bytes
+            && max_total < u64::try_from(self.cache.max_entry_bytes).unwrap_or(u64::MAX)
+        {
+            return Err(PolicyError::Validation(
+                "cache.max_total_bytes must be at least cache.max_entry_bytes".to_owned(),
+            ));
+        }
+        if self.cache.ttl_secs == Some(0) {
+            return Err(PolicyError::Validation(
+                "cache.ttl_secs must be greater than zero when set".to_owned(),
+            ));
+        }
+        if self.cache.sweep_interval_secs == 0 {
+            return Err(PolicyError::Validation(
+                "cache.sweep_interval_secs must be greater than zero".to_owned(),
+            ));
+        }
 
         if self.limits.max_input_bytes == 0 {
             return Err(PolicyError::Validation(
@@ -508,6 +540,15 @@ impl MurkletConfig {
             ));
         }
 
+        self.validate_origins()?;
+
+        // Validate all declared named presets eagerly at startup.
+        let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
+
+        Ok(())
+    }
+
+    fn validate_origins(&self) -> Result<(), PolicyError> {
         if !self.origins.local.enabled && !self.origins.http.enabled && !self.origins.s3.enabled {
             return Err(PolicyError::Validation(
                 "at least one origin (origins.local, origins.http, or origins.s3) must be enabled"
@@ -563,9 +604,6 @@ impl MurkletConfig {
             }
         }
 
-        // Validate all declared named presets eagerly at startup.
-        let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
-
         Ok(())
     }
 }
@@ -580,6 +618,10 @@ fn default_cache_control() -> String {
 
 fn default_cache_dir() -> PathBuf {
     PathBuf::from("./cache")
+}
+
+const fn default_cache_sweep_interval_secs() -> u64 {
+    DEFAULT_CACHE_SWEEP_INTERVAL_SECS
 }
 
 const fn default_max_input_bytes() -> usize {
@@ -710,6 +752,27 @@ max_decoded_pixels = 0
 ";
         assert!(matches!(
             MurkletConfig::from_toml_str(zero_pixels),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Cache disk budget smaller than max_entry_bytes is rejected.
+        let tiny_budget = "
+[cache]
+max_entry_bytes = 1024
+max_total_bytes = 512
+";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(tiny_budget),
+            Err(PolicyError::Validation(_))
+        ));
+
+        // Zero TTL is rejected.
+        let zero_ttl = "
+[cache]
+ttl_secs = 0
+";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(zero_ttl),
             Err(PolicyError::Validation(_))
         ));
     }
