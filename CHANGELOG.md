@@ -4,6 +4,14 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-21
+
+### Added
+
+- **Per-origin policies (`src/policy/origin_policy.rs`, `src/http/router.rs`, `src/http/explain.rs`):** Added declarative `[origins.<kind>.policy]` tables supporting `presets_only`, `allowed_presets`, `allowed_formats` (intersected with `Accept` negotiation), `max_target_dimension`, `default_watermark`, and per-origin `cache_control` overrides per ADR 0003.
+- **Selective per-source cache purge (`src/cache/fs.rs`, `src/http/router.rs`):** Updated `FsCache` to a source-bucketed layout (`<shard>/<source_digest>/<variant_key>.<ext>`) and added `POST /cache/purge?url=<source>` (plus `?url=<source>` on `POST /cache/cleanup`) for $O(1)$ per-source variant and raw-source cache invalidation.
+- **Offline policy test runner (`src/http/policy_test.rs`, `src/main.rs`):** Added `murklet test-policy <suite.toml> [config.toml]` to evaluate declarative TOML `[[case]]` assertions (`expect = "allow" | "deny"`, origin, preset, format, dimensions, watermark, `vary_accept`, and `reason_contains`) in CI without starting the server.
+
 ## [0.5.0] - 2026-11-21
 
 ### Added
