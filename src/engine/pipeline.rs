@@ -2,15 +2,18 @@
 
 use std::io::Cursor;
 
+use fast_image_resize::images::Image;
+use fast_image_resize::{
+    FilterType as FirFilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+};
 use image::codecs::avif::AvifEncoder;
 use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPDecoder;
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{
     AnimationDecoder, DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFormat,
-    ImageReader, Limits,
+    ImageReader, Limits, RgbImage, RgbaImage,
 };
 
 use crate::domain::{ImageDimensions, OutputFormat, ResizeFilter, SelectedFilter, TransformSpec};
@@ -84,11 +87,7 @@ pub fn transform(
     let processed = if output_dimensions == source_dimensions {
         decoded
     } else {
-        decoded.resize_exact(
-            output_dimensions.width(),
-            output_dimensions.height(),
-            map_filter(filter.filter),
-        )
+        resize_image(decoded, output_dimensions, filter.filter)?
     };
 
     let bytes = encode_image(processed, spec)?;
@@ -196,19 +195,72 @@ fn build_decoder_limits(limits: &EngineLimits) -> Limits {
     decoder_limits
 }
 
-/// Maps Murklet's domain [`ResizeFilter`] onto `image`'s resampling kernels.
+/// Resizes `image` to `target` dimensions using SIMD-accelerated `fast_image_resize`.
 ///
-/// `image` 0.25 exposes five kernels; `Box` maps to `Triangle` and `Hermite`/`BSpline`
-/// map to `CatmullRom` until a dedicated resampler is added.
-const fn map_filter(filter: ResizeFilter) -> FilterType {
+/// Opaque images are resampled in 3-channel `Rgb8` to minimise memory bandwidth;
+/// images with an alpha channel are resampled in 4-channel `Rgba8` to preserve transparency.
+fn resize_image(
+    image: DynamicImage,
+    target: ImageDimensions,
+    filter: ResizeFilter,
+) -> Result<DynamicImage, EngineError> {
+    let options = ResizeOptions::new().resize_alg(map_resize_alg(filter));
+    let mut resizer = Resizer::new();
+
+    if image.color().has_alpha() {
+        let src_rgba = image.into_rgba8();
+        let src_image = Image::from_vec_u8(
+            src_rgba.width(),
+            src_rgba.height(),
+            src_rgba.into_raw(),
+            PixelType::U8x4,
+        )
+        .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
+
+        let mut dst_image = Image::new(target.width(), target.height(), PixelType::U8x4);
+        resizer
+            .resize(&src_image, &mut dst_image, &options)
+            .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
+
+        let output_img = RgbaImage::from_raw(target.width(), target.height(), dst_image.into_vec())
+            .ok_or_else(|| {
+                EngineError::EncodeFailed("resized RGBA buffer length mismatch".to_owned())
+            })?;
+        Ok(DynamicImage::ImageRgba8(output_img))
+    } else {
+        let src_rgb = image.into_rgb8();
+        let src_image = Image::from_vec_u8(
+            src_rgb.width(),
+            src_rgb.height(),
+            src_rgb.into_raw(),
+            PixelType::U8x3,
+        )
+        .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
+
+        let mut dst_image = Image::new(target.width(), target.height(), PixelType::U8x3);
+        resizer
+            .resize(&src_image, &mut dst_image, &options)
+            .map_err(|err| EngineError::EncodeFailed(err.to_string()))?;
+
+        let output_img = RgbImage::from_raw(target.width(), target.height(), dst_image.into_vec())
+            .ok_or_else(|| {
+                EngineError::EncodeFailed("resized RGB buffer length mismatch".to_owned())
+            })?;
+        Ok(DynamicImage::ImageRgb8(output_img))
+    }
+}
+
+/// Maps Murklet's domain [`ResizeFilter`] onto `fast_image_resize`'s SIMD resampling kernels.
+const fn map_resize_alg(filter: ResizeFilter) -> ResizeAlg {
     match filter {
-        ResizeFilter::Nearest => FilterType::Nearest,
-        ResizeFilter::Box | ResizeFilter::Linear => FilterType::Triangle,
-        ResizeFilter::Hermite | ResizeFilter::CatmullRom | ResizeFilter::BSpline => {
-            FilterType::CatmullRom
-        }
-        ResizeFilter::Gaussian => FilterType::Gaussian,
-        ResizeFilter::Lanczos => FilterType::Lanczos3,
+        ResizeFilter::Nearest => ResizeAlg::Nearest,
+        ResizeFilter::Box => ResizeAlg::Convolution(FirFilterType::Box),
+        ResizeFilter::Linear => ResizeAlg::Convolution(FirFilterType::Bilinear),
+        ResizeFilter::Hermite => ResizeAlg::Convolution(FirFilterType::Hamming),
+        ResizeFilter::CatmullRom => ResizeAlg::Convolution(FirFilterType::CatmullRom),
+        ResizeFilter::BSpline => ResizeAlg::Convolution(FirFilterType::Mitchell),
+        ResizeFilter::Gaussian => ResizeAlg::Convolution(FirFilterType::Gaussian),
+        ResizeFilter::Lanczos => ResizeAlg::Convolution(FirFilterType::Lanczos3),
     }
 }
 
