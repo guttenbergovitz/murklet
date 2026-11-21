@@ -17,8 +17,8 @@ use image::{
 };
 
 use crate::domain::{
-    BackgroundColour, ImageDimensions, OutputFormat, ResizeFilter, Rotation, SelectedFilter,
-    TransformSpec, plan_resize,
+    BackgroundColour, Flip, ImageDimensions, ImageFilters, OutputFormat, ResizeFilter, Rotation,
+    SelectedFilter, TransformSpec, plan_resize,
 };
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
@@ -80,9 +80,12 @@ pub fn transform(
         });
     }
 
-    let decoded = apply_rotation(
-        decode_with_orientation(input, input_format, limits)?,
-        spec.rotation,
+    let decoded = apply_flip(
+        apply_rotation(
+            decode_with_orientation(input, input_format, limits)?,
+            spec.rotation,
+        ),
+        spec.filters.flip,
     );
     let source_dimensions = ImageDimensions::new(decoded.width(), decoded.height())
         .map_err(|err| EngineError::DecodeFailed(err.to_string()))?;
@@ -97,12 +100,13 @@ pub fn transform(
 
     let filter = ResizeFilter::select_for(spec.filter, cropped_dimensions, plan.output);
 
-    let processed = if plan.output == cropped_dimensions {
+    let resized = if plan.output == cropped_dimensions {
         cropped
     } else {
         resize_image(cropped, plan.output, filter.filter)?
     };
 
+    let processed = apply_pixel_filters(resized, &spec.filters);
     let bytes = encode_image(processed, spec)?;
 
     Ok(TransformOutput {
@@ -284,6 +288,38 @@ fn apply_rotation(image: DynamicImage, rotation: Rotation) -> DynamicImage {
         Rotation::Deg180 => image.rotate180(),
         Rotation::Deg270 => image.rotate270(),
     }
+}
+
+fn apply_flip(image: DynamicImage, flip: Flip) -> DynamicImage {
+    match flip {
+        Flip::None => image,
+        Flip::Horizontal => image.fliph(),
+        Flip::Vertical => image.flipv(),
+        Flip::Both => image.fliph().flipv(),
+    }
+}
+
+/// Applies post-resize pixel filters in Murklet's fixed canonical pipeline order.
+fn apply_pixel_filters(mut image: DynamicImage, filters: &ImageFilters) -> DynamicImage {
+    if filters.brightness.get() != 0 {
+        image = image.brighten(i32::from(filters.brightness.get()));
+    }
+    if filters.contrast.get() != 0 {
+        image = image.adjust_contrast(f32::from(filters.contrast.get()));
+    }
+    if filters.grayscale {
+        image = image.grayscale();
+    }
+    if filters.invert {
+        image.invert();
+    }
+    if let Some(blur) = filters.blur {
+        image = image.fast_blur(blur.as_f32());
+    }
+    if let Some(sharpen) = filters.sharpen {
+        image = image.unsharpen(sharpen.as_f32(), 1);
+    }
+    image
 }
 
 /// Composites an alpha-bearing image over a solid RGB background colour using
@@ -624,5 +660,53 @@ mod tests {
             .into_rgb8();
         let pixel = decoded.get_pixel(8, 8).0;
         assert!(pixel[0] >= 250 && pixel[1] >= 250 && pixel[2] >= 250);
+    }
+
+    #[test]
+    fn negative_grayscale_and_blur_filters_transform_pixels_deterministically() {
+        let solid = RgbaImage::from_pixel(16, 16, Rgba([10, 20, 30, 255]));
+        let mut solid_png = Vec::new();
+        DynamicImage::ImageRgba8(solid)
+            .write_to(&mut Cursor::new(&mut solid_png), ImageFormat::Png)
+            .unwrap();
+
+        // Negative filter inverts RGB channels: (10, 20, 30) -> (245, 235, 225).
+        let neg_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                invert: true,
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let neg = transform(&solid_png, &neg_spec, &EngineLimits::default()).unwrap();
+        let neg_img = ImageReader::new(Cursor::new(&neg.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        assert_eq!(neg_img.get_pixel(4, 4).0, [245, 235, 225]);
+
+        // Grayscale + blur pipeline runs cleanly and yields equal R=G=B channels.
+        let gs_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                grayscale: true,
+                blur: Some("1.5".parse().unwrap()),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let gs = transform(&solid_png, &gs_spec, &EngineLimits::default()).unwrap();
+        let gs_img = ImageReader::new(Cursor::new(&gs.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let px = gs_img.get_pixel(8, 8).0;
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
     }
 }

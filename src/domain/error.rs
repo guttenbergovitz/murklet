@@ -64,6 +64,16 @@ pub enum DomainError {
     InvalidDpr(String),
     /// Requested background colour is not valid 3- or 6-character RGB hex.
     InvalidBackground(String),
+    /// Requested mirror flip mode is not supported.
+    UnsupportedFlip(String),
+    /// Requested blur sigma is outside `0.5..=20.0` or malformed.
+    InvalidBlur(String),
+    /// Requested sharpen sigma is outside `0.5..=10.0` or malformed.
+    InvalidSharpen(String),
+    /// Requested brightness offset is outside `-100..=100`.
+    InvalidBrightness(i16),
+    /// Requested contrast adjustment is outside `-100..=100`.
+    InvalidContrast(i16),
 }
 
 impl fmt::Display for DomainError {
@@ -98,6 +108,21 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidBackground(raw) => {
                 write!(f, "background must be 3- or 6-digit RGB hex, got '{raw}'")
+            }
+            Self::UnsupportedFlip(raw) => {
+                write!(f, "unsupported flip mode: '{raw}' (use h, v, or hv)")
+            }
+            Self::InvalidBlur(raw) => {
+                write!(f, "blur sigma must be between 0.5 and 20.0, got '{raw}'")
+            }
+            Self::InvalidSharpen(raw) => {
+                write!(f, "sharpen sigma must be between 0.5 and 10.0, got '{raw}'")
+            }
+            Self::InvalidBrightness(val) => {
+                write!(f, "brightness must be between -100 and 100, got {val}")
+            }
+            Self::InvalidContrast(val) => {
+                write!(f, "contrast must be between -100 and 100, got {val}")
             }
         }
     }

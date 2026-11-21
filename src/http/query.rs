@@ -3,8 +3,9 @@
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, BackgroundColour, Dimension, Dpr, FitMode, Gravity, OutputFormat, Quality, ResizeFilter,
-    Rotation, TargetDimensions, TransformSpec,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, Dpr, FitMode, Flip,
+    Gravity, ImageFilters, OutputFormat, Quality, ResizeFilter, Rotation, SharpenSigma,
+    TargetDimensions, TransformSpec,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -36,6 +37,22 @@ pub struct RawLoadQuery {
     pub dpr: Option<String>,
     /// Optional RGB hex background colour for alpha flattening (for example `ffffff`).
     pub bg: Option<String>,
+    /// Optional mirror flip (`h`, `v`, `hv`).
+    pub flip: Option<String>,
+    /// Optional greyscale conversion (`true`/`false`/`1`/`0`).
+    #[serde(alias = "greyscale")]
+    pub grayscale: Option<String>,
+    /// Optional negative / colour inversion (`true`/`false`/`1`/`0`).
+    #[serde(alias = "negative")]
+    pub invert: Option<String>,
+    /// Optional blur sigma (`0.5..=20.0`).
+    pub blur: Option<String>,
+    /// Optional sharpen sigma (`0.5..=10.0`).
+    pub sharpen: Option<String>,
+    /// Optional brightness adjustment (`-100..=100`).
+    pub brightness: Option<String>,
+    /// Optional contrast adjustment (`-100..=100`).
+    pub contrast: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -76,22 +93,24 @@ pub fn parse_load_query_with_presets(
     max_dimension: u32,
     presets: &PresetRegistry,
 ) -> Result<ParsedLoadRequest, HttpError> {
+    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
+        match raw.preset.as_deref().filter(|value| !value.is_empty()) {
+            None => (None, ValidatedPreset::default()),
+            Some(name) => {
+                let found = presets
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
+                (Some(name.to_owned()), found)
+            }
+        };
+
+    let filters = parse_image_filters(&raw, &preset_defaults)?;
+
     let source = raw
         .url
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
-
-    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
-        match raw.preset.filter(|value| !value.is_empty()) {
-            None => (None, ValidatedPreset::default()),
-            Some(name) => {
-                let found = presets
-                    .get(&name)
-                    .copied()
-                    .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
-                (Some(name), found)
-            }
-        };
 
     let dpr = match raw.dpr.as_deref() {
         None | Some("") => preset_defaults.dpr.unwrap_or_default(),
@@ -170,9 +189,84 @@ pub fn parse_load_query_with_presets(
             gravity,
             rotation,
             background,
+            filters,
         },
         explicit_format,
     })
+}
+
+fn parse_image_filters(
+    raw: &RawLoadQuery,
+    preset: &ValidatedPreset,
+) -> Result<ImageFilters, HttpError> {
+    let flip = match raw.flip.as_deref() {
+        None | Some("") => preset.flip.unwrap_or_default(),
+        Some(value) => value.parse::<Flip>()?,
+    };
+
+    let grayscale = match raw.grayscale.as_deref() {
+        None | Some("") => preset.grayscale.unwrap_or(false),
+        Some(value) => parse_bool_param("grayscale", value)?,
+    };
+
+    let invert = match raw.invert.as_deref() {
+        None | Some("") => preset.invert.unwrap_or(false),
+        Some(value) => parse_bool_param("invert", value)?,
+    };
+
+    let blur = match raw.blur.as_deref() {
+        None | Some("") => preset.blur,
+        Some(value) => Some(value.parse::<BlurSigma>()?),
+    };
+
+    let sharpen = match raw.sharpen.as_deref() {
+        None | Some("") => preset.sharpen,
+        Some(value) => Some(value.parse::<SharpenSigma>()?),
+    };
+
+    let brightness = match raw.brightness.as_deref() {
+        None | Some("") => preset.brightness.unwrap_or_default(),
+        Some(value) => {
+            let parsed = value.parse::<i16>().map_err(|_| {
+                HttpError::BadRequest(format!(
+                    "query parameter 'brightness' must be an integer between -100 and 100, got '{value}'"
+                ))
+            })?;
+            Brightness::new(parsed)?
+        }
+    };
+
+    let contrast = match raw.contrast.as_deref() {
+        None | Some("") => preset.contrast.unwrap_or_default(),
+        Some(value) => {
+            let parsed = value.parse::<i16>().map_err(|_| {
+                HttpError::BadRequest(format!(
+                    "query parameter 'contrast' must be an integer between -100 and 100, got '{value}'"
+                ))
+            })?;
+            Contrast::new(parsed)?
+        }
+    };
+
+    Ok(ImageFilters {
+        flip,
+        grayscale,
+        invert,
+        blur,
+        sharpen,
+        brightness,
+        contrast,
+    })
+}
+
+fn parse_bool_param(name: &str, raw: &str) -> Result<bool, HttpError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(HttpError::BadRequest(format!(
+            "query parameter '{name}' must be true, false, 1, or 0, got '{raw}'"
+        ))),
+    }
 }
 
 fn apply_dpr_to_dimension(
