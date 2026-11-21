@@ -26,10 +26,10 @@ use crate::http::metrics::{
     CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
 };
 use crate::http::negotiate::negotiate_format;
-use crate::http::query::{RawLoadQuery, parse_load_query};
+use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HttpOrigin, LocalFsOrigin};
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
-use crate::policy::{DEFAULT_MAX_CONCURRENT_TRANSFORMS, RequestSigner};
+use crate::policy::{DEFAULT_MAX_CONCURRENT_TRANSFORMS, PresetRegistry, RequestSigner};
 
 const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
@@ -69,6 +69,8 @@ pub struct AppState {
     pub cleanup_token: Option<String>,
     /// Optional HMAC-SHA256 verifier requiring a valid `sig` parameter on `GET /load`.
     pub request_signer: Option<RequestSigner>,
+    /// Validated named transformation presets (`[presets.<name>]`).
+    pub presets: PresetRegistry,
     /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
     pub accept_negotiation: bool,
     /// When `true`, exposes Prometheus metrics at `GET /metrics`.
@@ -97,6 +99,7 @@ impl AppState {
             cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
             cleanup_token: None,
             request_signer: None,
+            presets: PresetRegistry::empty(),
             accept_negotiation: false,
             metrics_enabled: true,
             diagnostic_headers: false,
@@ -199,7 +202,8 @@ async fn handle_load_inner(
         return Err(HttpError::Unauthorized);
     }
 
-    let mut parsed = parse_load_query(raw_query, state.max_target_dimension)?;
+    let mut parsed =
+        parse_load_query_with_presets(raw_query, state.max_target_dimension, &state.presets)?;
     let vary_accept = state.accept_negotiation && !parsed.explicit_format;
     if vary_accept {
         let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
@@ -1123,5 +1127,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn load_applies_named_preset_and_shares_cache_with_equivalent_explicit_query() {
+        use std::collections::BTreeMap;
+
+        use crate::policy::PresetConfig;
+
+        let fixture = TestFixture::new("presets");
+        let mut raw_presets = BTreeMap::new();
+        raw_presets.insert(
+            "thumb".to_owned(),
+            PresetConfig {
+                width: Some(40),
+                height: None,
+                quality: Some(80),
+                format: Some("webp".to_owned()),
+                filter: None,
+            },
+        );
+
+        let mut state = fixture.state();
+        state.presets = PresetRegistry::from_config(&raw_presets, DEFAULT_MAX_DIMENSION).unwrap();
+        let app = build_router(Arc::new(state));
+
+        // Request via preset populates the cache.
+        let via_preset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&preset=thumb")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_preset.status(), StatusCode::OK);
+        assert_eq!(
+            via_preset.headers().get(CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+        assert_eq!(via_preset.headers().get("x-cache").unwrap(), "MISS");
+
+        // Equivalent explicit query hits the exact same canonical cache entry.
+        let via_explicit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&q=80&f=webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_explicit.status(), StatusCode::OK);
+        assert_eq!(via_explicit.headers().get("x-cache").unwrap(), "HIT");
+
+        // Unknown preset returns 400 Bad Request.
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&preset=does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
     }
 }

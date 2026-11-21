@@ -1,5 +1,6 @@
 //! Declarative TOML configuration and startup policy validation.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use crate::engine::{
 };
 use crate::origin::{DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig};
 use crate::policy::error::PolicyError;
+use crate::policy::presets::{PresetConfig, PresetRegistry};
 use crate::policy::signing::RequestSigner;
 
 /// Default `Cache-Control` header applied to served image variants.
@@ -38,6 +40,9 @@ pub struct MurkletConfig {
     /// Enabled origins and their access policies.
     #[serde(default)]
     pub origins: OriginsConfig,
+    /// Optional named transformation presets (`[presets.<name>]`).
+    #[serde(default)]
+    pub presets: BTreeMap<String, PresetConfig>,
 }
 
 /// Structured log output format (`server.log_format`).
@@ -308,6 +313,15 @@ impl MurkletConfig {
             .transpose()
     }
 
+    /// Builds a validated [`PresetRegistry`] from `[presets.*]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::Validation`] if any preset is invalid.
+    pub fn preset_registry(&self) -> Result<PresetRegistry, PolicyError> {
+        PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)
+    }
+
     /// Builds an [`HttpOriginConfig`] when `[origins.http]` is enabled, or `None` when disabled.
     #[must_use]
     pub fn http_origin_config(&self) -> Option<HttpOriginConfig> {
@@ -400,6 +414,9 @@ impl MurkletConfig {
                 ));
             }
         }
+
+        // Validate all declared named presets eagerly at startup.
+        let _ = PresetRegistry::from_config(&self.presets, self.limits.max_target_dimension)?;
 
         Ok(())
     }

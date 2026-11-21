@@ -39,3 +39,9 @@ allowed_hosts = []
 timeout_secs = 15
 connect_timeout_secs = 5
 max_redirects = 5
+
+# Optional named transformation presets referenced via `?preset=<name>`.
+# [presets.thumb]
+# width = 300
+# format = "webp"
+# quality = 80

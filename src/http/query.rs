@@ -6,12 +6,15 @@ use crate::domain::{
     Axis, Dimension, OutputFormat, Quality, ResizeFilter, TargetDimensions, TransformSpec,
 };
 use crate::http::error::HttpError;
+use crate::policy::{PresetRegistry, ValidatedPreset};
 
 /// Raw query parameters accepted by `GET /load` before domain validation.
 #[derive(Debug, Default, Deserialize)]
 pub struct RawLoadQuery {
     /// Source asset identifier or URL.
     pub url: Option<String>,
+    /// Optional named preset declared in `[presets.<name>]`.
+    pub preset: Option<String>,
     /// Optional target width (`0` means unset; `1..=max` sets target width).
     pub w: Option<String>,
     /// Optional target height (`0` means unset; `1..=max` sets target height).
@@ -29,32 +32,63 @@ pub struct RawLoadQuery {
 pub struct ParsedLoadRequest {
     /// Validated non-empty source reference.
     pub source: String,
+    /// Optional matched preset name.
+    pub preset: Option<String>,
     /// Canonical transformation specification.
     pub spec: TransformSpec,
-    /// `true` when the client supplied an explicit non-empty `f` query parameter.
+    /// `true` when the client (or matched preset) explicitly specified an output format.
     pub explicit_format: bool,
 }
 
-/// Parses and strictly validates raw query parameters into a [`ParsedLoadRequest`].
+/// Parses and strictly validates raw query parameters without named presets.
 ///
 /// # Errors
 ///
-/// Returns [`HttpError::BadRequest`] if `url` is missing/empty or any numeric/enum
-/// parameter is malformed or outside permitted bounds.
+/// Returns [`HttpError::BadRequest`] if `url` is missing/empty or any parameter
+/// is malformed or outside permitted bounds.
 pub fn parse_load_query(
     raw: RawLoadQuery,
     max_dimension: u32,
+) -> Result<ParsedLoadRequest, HttpError> {
+    parse_load_query_with_presets(raw, max_dimension, &PresetRegistry::empty())
+}
+
+/// Parses and strictly validates raw query parameters, applying optional named preset
+/// defaults before explicit query-parameter overrides.
+///
+/// # Errors
+///
+/// Returns [`HttpError::BadRequest`] if `url` is missing/empty, `preset` is unknown,
+/// or any parameter is malformed or outside permitted bounds.
+pub fn parse_load_query_with_presets(
+    raw: RawLoadQuery,
+    max_dimension: u32,
+    presets: &PresetRegistry,
 ) -> Result<ParsedLoadRequest, HttpError> {
     let source = raw
         .url
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
 
-    let width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?;
-    let height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?;
+    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
+        match raw.preset.filter(|value| !value.is_empty()) {
+            None => (None, ValidatedPreset::default()),
+            Some(name) => {
+                let found = presets
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
+                (Some(name), found)
+            }
+        };
+
+    let width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?
+        .or(preset_defaults.width);
+    let height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?
+        .or(preset_defaults.height);
 
     let quality = match raw.q.as_deref() {
-        None | Some("") => Quality::DEFAULT,
+        None | Some("") => preset_defaults.quality.unwrap_or_default(),
         Some(value) => {
             let parsed = value.parse::<u8>().map_err(|_| {
                 HttpError::BadRequest(format!(
@@ -66,17 +100,21 @@ pub fn parse_load_query(
     };
 
     let (format, explicit_format) = match raw.f.as_deref() {
-        None | Some("") => (OutputFormat::default(), false),
+        None | Some("") => match preset_defaults.format {
+            Some(preset_fmt) => (preset_fmt, true),
+            None => (OutputFormat::default(), false),
+        },
         Some(value) => (value.parse::<OutputFormat>()?, true),
     };
 
     let filter = match raw.filter.as_deref() {
-        None | Some("") => None,
+        None | Some("") => preset_defaults.filter,
         Some(value) => Some(value.parse::<ResizeFilter>()?),
     };
 
     Ok(ParsedLoadRequest {
         source,
+        preset: preset_name,
         spec: TransformSpec {
             dimensions: TargetDimensions::new(width, height),
             format,
@@ -119,6 +157,7 @@ mod tests {
         let parsed = parse_load_query(
             RawLoadQuery {
                 url: Some("products/hero.png".to_owned()),
+                preset: None,
                 w: Some("800".to_owned()),
                 h: Some("0".to_owned()),
                 q: Some("85".to_owned()),
