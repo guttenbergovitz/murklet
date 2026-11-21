@@ -112,15 +112,18 @@ pub enum OriginKind {
     Local,
     /// Remote HTTP(S) origin.
     Http,
+    /// S3-compatible object storage origin.
+    S3,
 }
 
 impl OriginKind {
-    const ALL: [Self; 2] = [Self::Local, Self::Http];
+    const ALL: [Self; 3] = [Self::Local, Self::Http, Self::S3];
 
     const fn index(self) -> usize {
         match self {
             Self::Local => 0,
             Self::Http => 1,
+            Self::S3 => 2,
         }
     }
 
@@ -130,6 +133,7 @@ impl OriginKind {
         match self {
             Self::Local => "local",
             Self::Http => "http",
+            Self::S3 => "s3",
         }
     }
 }
@@ -156,7 +160,7 @@ const fn format_index(format: OutputFormat) -> usize {
 #[derive(Debug, Default)]
 pub struct Metrics {
     load_requests: [[AtomicU64; 4]; 4],
-    transforms: [[AtomicU64; 5]; 2],
+    transforms: [[AtomicU64; 5]; 3],
     in_flight_transforms: AtomicUsize,
     transform_buckets: [AtomicU64; 10],
     transform_count: AtomicU64,

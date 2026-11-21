@@ -4,10 +4,11 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use murklet::cache::FsCache;
 use murklet::http::{AppState, build_router, explain_load_request};
-use murklet::origin::{HttpOrigin, LocalFsOrigin};
+use murklet::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 use murklet::policy::{LogFormatConfig, MurkletConfig};
 use tracing_subscriber::EnvFilter;
 
@@ -90,12 +91,53 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
         .map(HttpOrigin::new)
         .transpose()?;
 
-    let cache = FsCache::new(&config.cache.dir, config.cache.max_entry_bytes)?;
+    let s3_origin = config.s3_origin_config()?.map(S3Origin::new).transpose()?;
+
+    let cache = FsCache::new(&config.cache.dir, config.cache.max_entry_bytes)?
+        .with_max_total_bytes(config.cache.max_total_bytes)
+        .with_ttl(config.cache.ttl_secs.map(Duration::from_secs));
+    let sweeper = if config.cache.max_total_bytes.is_some() || config.cache.ttl_secs.is_some() {
+        let sweep_cache = cache.clone();
+        let interval = Duration::from_secs(config.cache.sweep_interval_secs);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let handle = sweep_cache.clone();
+                match tokio::task::spawn_blocking(move || handle.evict()).await {
+                    Ok(Ok(report)) => {
+                        if report.expired_removed > 0 || report.evicted_for_size > 0 {
+                            tracing::info!(
+                                expired_removed = report.expired_removed,
+                                evicted_for_size = report.evicted_for_size,
+                                freed_bytes = report.freed_bytes,
+                                remaining_entries = report.remaining_entries,
+                                remaining_bytes = report.remaining_bytes,
+                                "cache eviction sweep completed"
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "cache eviction sweep failed");
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "cache eviction task panicked");
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     let request_signer = config.request_signer()?;
     let presets = config.preset_registry()?;
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
         .with_max_concurrent_transforms(config.limits.max_concurrent_transforms);
+    if let Some(s3) = s3_origin {
+        state = state.with_s3_origin(s3);
+    }
     state.engine_limits = config.engine_limits();
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;
@@ -112,6 +154,7 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
         bind = %config.server.bind,
         local_origin = config.origins.local.enabled,
         http_origin = config.origins.http.enabled,
+        s3_origin = config.origins.s3.enabled,
         metrics_enabled = config.server.metrics_enabled,
         presets = config.presets.len(),
         "murklet server listening"
@@ -120,6 +163,10 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    if let Some(handle) = sweeper {
+        handle.abort();
+    }
 
     Ok(())
 }

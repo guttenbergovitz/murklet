@@ -3,7 +3,9 @@
 use serde::Deserialize;
 
 use crate::domain::{
-    Axis, Dimension, OutputFormat, Quality, ResizeFilter, TargetDimensions, TransformSpec,
+    Axis, BackgroundColour, BlurSigma, Brightness, Contrast, Dimension, DomainError, Dpr, FitMode,
+    Flip, Gamma, Gravity, Hue, ImageFilters, OutputFormat, Quality, ResizeFilter, Rotation,
+    Saturation, Sepia, SharpenSigma, TargetDimensions, TransformSpec,
 };
 use crate::http::error::HttpError;
 use crate::policy::{PresetRegistry, ValidatedPreset};
@@ -25,6 +27,43 @@ pub struct RawLoadQuery {
     pub f: Option<String>,
     /// Optional resampling filter (`nearest`, `box`, `linear`, `hermite`, `catmullrom`, `bspline`, `gaussian`, `lanczos`).
     pub filter: Option<String>,
+    /// Optional fit mode (`fill`, `contain`, `cover`, `scale-down`).
+    pub fit: Option<String>,
+    /// Optional crop gravity or focal point (`center`, `north`, `fp:0.5:0.2`, etc.).
+    pub gravity: Option<String>,
+    /// Optional clockwise rotation (`0`, `90`, `180`, `270`).
+    pub rotate: Option<String>,
+    /// Optional device pixel ratio (`1.0`..=`3.0`).
+    pub dpr: Option<String>,
+    /// Optional RGB hex background colour for alpha flattening (for example `ffffff`).
+    pub bg: Option<String>,
+    /// Optional mirror flip (`h`, `v`, `hv`).
+    pub flip: Option<String>,
+    /// Optional greyscale conversion (`true`/`false`/`1`/`0`).
+    #[serde(alias = "greyscale")]
+    pub grayscale: Option<String>,
+    /// Optional negative / colour inversion (`true`/`false`/`1`/`0`).
+    #[serde(alias = "negative")]
+    pub invert: Option<String>,
+    /// Optional blur sigma (`0.5..=20.0`).
+    pub blur: Option<String>,
+    /// Optional sharpen sigma (`0.5..=10.0`).
+    pub sharpen: Option<String>,
+    /// Optional brightness adjustment (`-100..=100`).
+    pub brightness: Option<String>,
+    /// Optional contrast adjustment (`-100..=100`).
+    pub contrast: Option<String>,
+    /// Optional saturation adjustment (`-100..=100`).
+    pub saturation: Option<String>,
+    /// Optional hue rotation (`-360..=360`).
+    pub hue: Option<String>,
+    /// Optional tonal gamma (`0.2..=5.0`).
+    pub gamma: Option<String>,
+    /// Optional sepia intensity (`0..=100`, or `true`/`false`).
+    pub sepia: Option<String>,
+    /// Optional brand monochrome tint colour (3- or 6-digit RGB hex).
+    #[serde(alias = "mono", alias = "monochrome")]
+    pub tint: Option<String>,
 }
 
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
@@ -65,27 +104,37 @@ pub fn parse_load_query_with_presets(
     max_dimension: u32,
     presets: &PresetRegistry,
 ) -> Result<ParsedLoadRequest, HttpError> {
+    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
+        match raw.preset.as_deref().filter(|value| !value.is_empty()) {
+            None => (None, ValidatedPreset::default()),
+            Some(name) => {
+                let found = presets
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
+                (Some(name.to_owned()), found)
+            }
+        };
+
+    let filters = parse_image_filters(&raw, &preset_defaults)?;
+
     let source = raw
         .url
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
 
-    let (preset_name, preset_defaults): (Option<String>, ValidatedPreset) =
-        match raw.preset.filter(|value| !value.is_empty()) {
-            None => (None, ValidatedPreset::default()),
-            Some(name) => {
-                let found = presets
-                    .get(&name)
-                    .copied()
-                    .ok_or_else(|| HttpError::BadRequest(format!("unknown preset '{name}'")))?;
-                (Some(name), found)
-            }
-        };
+    let dpr = match raw.dpr.as_deref() {
+        None | Some("") => preset_defaults.dpr.unwrap_or_default(),
+        Some(value) => value.parse::<Dpr>()?,
+    };
 
-    let width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?
+    let base_width = parse_optional_dimension(raw.w.as_deref(), Axis::Width, max_dimension)?
         .or(preset_defaults.width);
-    let height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?
+    let base_height = parse_optional_dimension(raw.h.as_deref(), Axis::Height, max_dimension)?
         .or(preset_defaults.height);
+
+    let width = apply_dpr_to_dimension(base_width, dpr, Axis::Width, max_dimension)?;
+    let height = apply_dpr_to_dimension(base_height, dpr, Axis::Height, max_dimension)?;
 
     let quality = match raw.q.as_deref() {
         None | Some("") => preset_defaults.quality.unwrap_or_default(),
@@ -112,6 +161,33 @@ pub fn parse_load_query_with_presets(
         Some(value) => Some(value.parse::<ResizeFilter>()?),
     };
 
+    let fit = match raw.fit.as_deref() {
+        None | Some("") => preset_defaults.fit.unwrap_or_default(),
+        Some(value) => value.parse::<FitMode>()?,
+    };
+
+    let gravity = match raw.gravity.as_deref() {
+        None | Some("") => preset_defaults.gravity.unwrap_or_default(),
+        Some(value) => value.parse::<Gravity>()?,
+    };
+
+    let rotation = match raw.rotate.as_deref() {
+        None | Some("") => preset_defaults.rotation.unwrap_or_default(),
+        Some(value) => {
+            let degrees = value.parse::<u16>().map_err(|_| {
+                HttpError::BadRequest(format!(
+                    "query parameter 'rotate' must be 0, 90, 180, or 270, got '{value}'"
+                ))
+            })?;
+            Rotation::from_degrees(degrees)?
+        }
+    };
+
+    let background = match raw.bg.as_deref() {
+        None | Some("") => preset_defaults.background,
+        Some(value) => Some(value.parse::<BackgroundColour>()?),
+    };
+
     Ok(ParsedLoadRequest {
         source,
         preset: preset_name,
@@ -120,9 +196,128 @@ pub fn parse_load_query_with_presets(
             format,
             quality,
             filter,
+            fit,
+            gravity,
+            rotation,
+            background,
+            filters,
         },
         explicit_format,
     })
+}
+
+fn parse_image_filters(
+    raw: &RawLoadQuery,
+    preset: &ValidatedPreset,
+) -> Result<ImageFilters, HttpError> {
+    let flip = match raw.flip.as_deref() {
+        None | Some("") => preset.flip.unwrap_or_default(),
+        Some(value) => value.parse::<Flip>()?,
+    };
+    let grayscale = match raw.grayscale.as_deref() {
+        None | Some("") => preset.grayscale.unwrap_or(false),
+        Some(value) => parse_bool_param("grayscale", value)?,
+    };
+    let invert = match raw.invert.as_deref() {
+        None | Some("") => preset.invert.unwrap_or(false),
+        Some(value) => parse_bool_param("invert", value)?,
+    };
+    let blur = match raw.blur.as_deref() {
+        None | Some("") => preset.blur,
+        Some(value) => Some(value.parse::<BlurSigma>()?),
+    };
+    let sharpen = match raw.sharpen.as_deref() {
+        None | Some("") => preset.sharpen,
+        Some(value) => Some(value.parse::<SharpenSigma>()?),
+    };
+    let brightness = match raw.brightness.as_deref() {
+        None | Some("") => preset.brightness.unwrap_or_default(),
+        Some(value) => Brightness::new(parse_signed_param("brightness", value, -100, 100)?)?,
+    };
+    let contrast = match raw.contrast.as_deref() {
+        None | Some("") => preset.contrast.unwrap_or_default(),
+        Some(value) => Contrast::new(parse_signed_param("contrast", value, -100, 100)?)?,
+    };
+    let saturation = match raw.saturation.as_deref() {
+        None | Some("") => preset.saturation.unwrap_or_default(),
+        Some(value) => Saturation::new(parse_signed_param("saturation", value, -100, 100)?)?,
+    };
+    let hue = match raw.hue.as_deref() {
+        None | Some("") => preset.hue.unwrap_or_default(),
+        Some(value) => {
+            let parsed = value.parse::<i32>().map_err(|_| {
+                HttpError::BadRequest(format!(
+                    "query parameter 'hue' must be an integer between -360 and 360, got '{value}'"
+                ))
+            })?;
+            Hue::new(parsed)?
+        }
+    };
+    let gamma = match raw.gamma.as_deref() {
+        None | Some("") => preset.gamma.unwrap_or_default(),
+        Some(value) => value.parse::<Gamma>()?,
+    };
+    let sepia = match raw.sepia.as_deref() {
+        None | Some("") => preset.sepia.unwrap_or_default(),
+        Some(value) => value.parse::<Sepia>()?,
+    };
+    let tint = match raw.tint.as_deref() {
+        None | Some("") => preset.tint,
+        Some(value) => Some(
+            value
+                .parse::<BackgroundColour>()
+                .map_err(|_| DomainError::InvalidTint(value.to_owned()))?,
+        ),
+    };
+
+    Ok(ImageFilters {
+        flip,
+        grayscale,
+        invert,
+        blur,
+        sharpen,
+        brightness,
+        contrast,
+        saturation,
+        hue,
+        gamma,
+        sepia,
+        tint,
+    })
+}
+
+fn parse_signed_param(name: &str, raw: &str, min: i16, max: i16) -> Result<i16, HttpError> {
+    raw.parse::<i16>().map_err(|_| {
+        HttpError::BadRequest(format!(
+            "query parameter '{name}' must be an integer between {min} and {max}, got '{raw}'"
+        ))
+    })
+}
+
+fn parse_bool_param(name: &str, raw: &str) -> Result<bool, HttpError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(HttpError::BadRequest(format!(
+            "query parameter '{name}' must be true, false, 1, or 0, got '{raw}'"
+        ))),
+    }
+}
+
+fn apply_dpr_to_dimension(
+    dim: Option<Dimension>,
+    dpr: Dpr,
+    axis: Axis,
+    max_dimension: u32,
+) -> Result<Option<Dimension>, HttpError> {
+    let Some(base) = dim else {
+        return Ok(None);
+    };
+    if dpr == Dpr::ONE {
+        return Ok(Some(base));
+    }
+    let scaled = dpr.scale_dimension(base.get());
+    Ok(Some(Dimension::new(axis, scaled, max_dimension)?))
 }
 
 fn parse_optional_dimension(
@@ -163,6 +358,7 @@ mod tests {
                 q: Some("85".to_owned()),
                 f: Some("WebP".to_owned()),
                 filter: Some("lanczos".to_owned()),
+                ..RawLoadQuery::default()
             },
             DEFAULT_MAX_DIMENSION,
         )

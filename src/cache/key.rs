@@ -84,6 +84,7 @@ mod tests {
             format: OutputFormat::Png,
             quality: Quality::new(30).unwrap(),
             filter: None,
+            ..TransformSpec::default()
         };
         let spec_b = TransformSpec {
             quality: Quality::new(90).unwrap(),

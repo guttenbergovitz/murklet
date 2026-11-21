@@ -16,7 +16,10 @@ use image::{
     ImageReader, Limits, RgbImage, RgbaImage,
 };
 
-use crate::domain::{ImageDimensions, OutputFormat, ResizeFilter, SelectedFilter, TransformSpec};
+use crate::domain::{
+    BackgroundColour, Flip, ImageDimensions, ImageFilters, OutputFormat, ResizeFilter, Rotation,
+    SelectedFilter, TransformSpec, plan_resize,
+};
 use crate::engine::error::EngineError;
 use crate::engine::limits::{AnimationPolicy, EngineLimits};
 
@@ -77,26 +80,40 @@ pub fn transform(
         });
     }
 
-    let decoded = decode_with_orientation(input, input_format, limits)?;
+    let decoded = apply_flip(
+        apply_rotation(
+            decode_with_orientation(input, input_format, limits)?,
+            spec.rotation,
+        ),
+        spec.filters.flip,
+    );
     let source_dimensions = ImageDimensions::new(decoded.width(), decoded.height())
         .map_err(|err| EngineError::DecodeFailed(err.to_string()))?;
 
-    let output_dimensions = spec.dimensions.resolve(source_dimensions);
-    let filter = ResizeFilter::select_for(spec.filter, source_dimensions, output_dimensions);
+    let plan = plan_resize(source_dimensions, spec.dimensions, spec.fit, spec.gravity);
+    let cropped = match plan.crop {
+        Some(rect) => decoded.crop_imm(rect.x, rect.y, rect.width, rect.height),
+        None => decoded,
+    };
+    let cropped_dimensions = ImageDimensions::new(cropped.width(), cropped.height())
+        .map_err(|err| EngineError::DecodeFailed(err.to_string()))?;
 
-    let processed = if output_dimensions == source_dimensions {
-        decoded
+    let filter = ResizeFilter::select_for(spec.filter, cropped_dimensions, plan.output);
+
+    let resized = if plan.output == cropped_dimensions {
+        cropped
     } else {
-        resize_image(decoded, output_dimensions, filter.filter)?
+        resize_image(cropped, plan.output, filter.filter)?
     };
 
+    let processed = apply_pixel_filters(resized, &spec.filters);
     let bytes = encode_image(processed, spec)?;
 
     Ok(TransformOutput {
         bytes,
         format: spec.format,
         source_dimensions,
-        output_dimensions,
+        output_dimensions: plan.output,
         filter,
         was_passthrough: false,
     })
@@ -264,13 +281,196 @@ const fn map_resize_alg(filter: ResizeFilter) -> ResizeAlg {
     }
 }
 
+fn apply_rotation(image: DynamicImage, rotation: Rotation) -> DynamicImage {
+    match rotation {
+        Rotation::Deg0 => image,
+        Rotation::Deg90 => image.rotate90(),
+        Rotation::Deg180 => image.rotate180(),
+        Rotation::Deg270 => image.rotate270(),
+    }
+}
+
+fn apply_flip(image: DynamicImage, flip: Flip) -> DynamicImage {
+    match flip {
+        Flip::None => image,
+        Flip::Horizontal => image.fliph(),
+        Flip::Vertical => image.flipv(),
+        Flip::Both => image.fliph().flipv(),
+    }
+}
+
+/// Applies post-resize pixel filters in Murklet's fixed canonical pipeline order.
+fn apply_pixel_filters(mut image: DynamicImage, filters: &ImageFilters) -> DynamicImage {
+    if filters.brightness.get() != 0 {
+        image = image.brighten(i32::from(filters.brightness.get()));
+    }
+    if filters.contrast.get() != 0 {
+        image = image.adjust_contrast(f32::from(filters.contrast.get()));
+    }
+    if filters.saturation.get() != 0 {
+        image = apply_saturation(image, filters.saturation.get());
+    }
+    if filters.hue.degrees() != 0 {
+        image = image.huerotate(i32::from(filters.hue.degrees()));
+    }
+    if !filters.gamma.is_identity() {
+        image = apply_gamma(image, filters.gamma.as_f32());
+    }
+    if filters.grayscale {
+        image = image.grayscale();
+    }
+    if filters.sepia.get() != 0 {
+        image = apply_sepia(image, filters.sepia.get());
+    }
+    if let Some(tint) = filters.tint {
+        image = apply_monochrome_tint(image, tint);
+    }
+    if filters.invert {
+        image.invert();
+    }
+    if let Some(blur) = filters.blur {
+        image = image.fast_blur(blur.as_f32());
+    }
+    if let Some(sharpen) = filters.sharpen {
+        image = image.unsharpen(sharpen.as_f32(), 1);
+    }
+    image
+}
+
+/// Applies a per-pixel RGB transform while preserving any alpha channel intact.
+fn map_rgb_pixels<F>(image: DynamicImage, mut op: F) -> DynamicImage
+where
+    F: FnMut([u8; 3]) -> [u8; 3],
+{
+    if image.color().has_alpha() {
+        let mut rgba = image.into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            let [r, g, b] = op([pixel.0[0], pixel.0[1], pixel.0[2]]);
+            pixel.0[0] = r;
+            pixel.0[1] = g;
+            pixel.0[2] = b;
+        }
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = image.into_rgb8();
+        for pixel in rgb.pixels_mut() {
+            pixel.0 = op(pixel.0);
+        }
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_f32_to_u8(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+/// Adjusts saturation around Rec.709 luminance (`-100` = greyscale, `0` = identity, `+100` = 2×).
+fn apply_saturation(image: DynamicImage, amount: i8) -> DynamicImage {
+    let factor = 1.0 + f32::from(amount) / 100.0;
+    map_rgb_pixels(image, |[r, g, b]| {
+        let rf = f32::from(r);
+        let gf = f32::from(g);
+        let bf = f32::from(b);
+        let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+        [
+            clamp_f32_to_u8(luma + (rf - luma) * factor),
+            clamp_f32_to_u8(luma + (gf - luma) * factor),
+            clamp_f32_to_u8(luma + (bf - luma) * factor),
+        ]
+    })
+}
+
+/// Applies tonal gamma correction via a precomputed 256-byte lookup table (`> 1.0` brightens midtones).
+fn apply_gamma(image: DynamicImage, gamma: f32) -> DynamicImage {
+    let inv_gamma = 1.0 / gamma;
+    let mut lut = [0_u8; 256];
+    for (idx, slot) in lut.iter_mut().enumerate() {
+        let norm = f32::from(u8::try_from(idx).unwrap_or(255)) / 255.0;
+        *slot = clamp_f32_to_u8(norm.powf(inv_gamma) * 255.0);
+    }
+    map_rgb_pixels(image, |[r, g, b]| {
+        [
+            lut[usize::from(r)],
+            lut[usize::from(g)],
+            lut[usize::from(b)],
+        ]
+    })
+}
+
+/// Applies a vintage sepia matrix blended linearly with the original pixel by `amount` (`0..=100`).
+fn apply_sepia(image: DynamicImage, amount: u8) -> DynamicImage {
+    let strength = f32::from(amount) / 100.0;
+    map_rgb_pixels(image, |[r, g, b]| {
+        let rf = f32::from(r);
+        let gf = f32::from(g);
+        let bf = f32::from(b);
+        let sr = (0.393 * rf + 0.769 * gf + 0.189 * bf).min(255.0);
+        let sg = (0.349 * rf + 0.686 * gf + 0.168 * bf).min(255.0);
+        let sb = (0.272 * rf + 0.534 * gf + 0.131 * bf).min(255.0);
+        [
+            clamp_f32_to_u8(rf + (sr - rf) * strength),
+            clamp_f32_to_u8(gf + (sg - gf) * strength),
+            clamp_f32_to_u8(bf + (sb - bf) * strength),
+        ]
+    })
+}
+
+/// Converts any image into a brand monochrome duotone (`black -> tint -> white`)
+/// driven by Rec.709 luminance while keeping shadows crisp, highlights clean, and alpha intact.
+fn apply_monochrome_tint(image: DynamicImage, tint: BackgroundColour) -> DynamicImage {
+    map_rgb_pixels(image, |[r, g, b]| {
+        // Exact 8-bit Rec.709 luminance (54 + 183 + 19 = 256).
+        let luma = (54 * u32::from(r) + 183 * u32::from(g) + 19 * u32::from(b) + 128) >> 8;
+        let ramp = |base: u8| -> u8 {
+            let base_u32 = u32::from(base);
+            let out = if luma <= 128 {
+                (base_u32 * luma + 64) / 128
+            } else {
+                base_u32 + ((255 - base_u32) * (luma - 128) + 63) / 127
+            };
+            u8::try_from(out).unwrap_or(255)
+        };
+        [ramp(tint.r), ramp(tint.g), ramp(tint.b)]
+    })
+}
+
+/// Composites an alpha-bearing image over a solid RGB background colour using
+/// exact integer blending (`(fg * a + bg * (255 - a) + 127) / 255`).
+fn flatten_over_background(image: DynamicImage, bg: BackgroundColour) -> RgbImage {
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut rgb = RgbImage::new(width, height);
+
+    for (dst, src) in rgb.pixels_mut().zip(rgba.pixels()) {
+        let [sr, sg, sb, sa] = src.0;
+        let alpha = u16::from(sa);
+        let inv_alpha = 255 - alpha;
+
+        let blend = |fg: u8, bg_ch: u8| -> u8 {
+            let mixed = (u16::from(fg) * alpha + u16::from(bg_ch) * inv_alpha + 127) / 255;
+            u8::try_from(mixed).unwrap_or(255)
+        };
+
+        dst.0 = [blend(sr, bg.r), blend(sg, bg.g), blend(sb, bg.b)];
+    }
+
+    rgb
+}
+
 /// Encodes a processed image into the format and quality requested in `spec`.
 fn encode_image(image: DynamicImage, spec: &TransformSpec) -> Result<Vec<u8>, EngineError> {
     let mut output = Vec::new();
 
     match spec.format {
         OutputFormat::Jpeg => {
-            let rgb = image.into_rgb8();
+            let rgb = if image.color().has_alpha()
+                && let Some(bg) = spec.background
+            {
+                flatten_over_background(image, bg)
+            } else {
+                image.into_rgb8()
+            };
             let mut encoder = JpegEncoder::new_with_quality(&mut output, spec.quality.get());
             encoder
                 .encode_image(&rgb)
@@ -384,6 +584,7 @@ mod tests {
             format: OutputFormat::Avif,
             quality: Quality::new(70).unwrap(),
             filter: None,
+            ..TransformSpec::default()
         };
 
         let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
@@ -442,6 +643,7 @@ mod tests {
                 format,
                 quality: Quality::new(80).unwrap(),
                 filter: None,
+                ..TransformSpec::default()
             };
 
             let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
@@ -501,6 +703,7 @@ mod tests {
             format: OutputFormat::Png,
             quality: Quality::DEFAULT,
             filter: None,
+            ..TransformSpec::default()
         };
 
         // Default policy: transforms the first frame to the requested format and size.
@@ -525,5 +728,178 @@ mod tests {
             passthrough.output_dimensions,
             ImageDimensions::new(32, 16).unwrap()
         );
+    }
+
+    #[test]
+    fn cover_crop_rotation_and_background_flatten_work_end_to_end() {
+        use crate::domain::{FitMode, Gravity};
+
+        // 80x40 rotated 90 degrees becomes 40x80, then cover-cropped to 20x20.
+        let png = make_png(80, 40);
+        let spec = TransformSpec {
+            dimensions: TargetDimensions::new(
+                Some(Dimension::new(Axis::Width, 20, DEFAULT_MAX_DIMENSION).unwrap()),
+                Some(Dimension::new(Axis::Height, 20, DEFAULT_MAX_DIMENSION).unwrap()),
+            ),
+            format: OutputFormat::Png,
+            fit: FitMode::Cover,
+            gravity: Gravity::North,
+            rotation: Rotation::Deg90,
+            ..TransformSpec::default()
+        };
+        let out = transform(&png, &spec, &EngineLimits::default()).unwrap();
+        assert_eq!(out.source_dimensions, ImageDimensions::new(40, 80).unwrap());
+        assert_eq!(out.output_dimensions, ImageDimensions::new(20, 20).unwrap());
+
+        // Transparent 16x16 PNG flattened onto pure white JPEG should decode near white.
+        let transparent = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0]));
+        let mut transparent_png = Vec::new();
+        DynamicImage::ImageRgba8(transparent)
+            .write_to(&mut Cursor::new(&mut transparent_png), ImageFormat::Png)
+            .unwrap();
+
+        let flat_spec = TransformSpec {
+            format: OutputFormat::Jpeg,
+            quality: Quality::new(95).unwrap(),
+            background: Some("ffffff".parse().unwrap()),
+            ..TransformSpec::default()
+        };
+        let flat = transform(&transparent_png, &flat_spec, &EngineLimits::default()).unwrap();
+        let decoded = ImageReader::new(Cursor::new(&flat.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let pixel = decoded.get_pixel(8, 8).0;
+        assert!(pixel[0] >= 250 && pixel[1] >= 250 && pixel[2] >= 250);
+    }
+
+    #[test]
+    fn negative_grayscale_and_blur_filters_transform_pixels_deterministically() {
+        let solid = RgbaImage::from_pixel(16, 16, Rgba([10, 20, 30, 255]));
+        let mut solid_png = Vec::new();
+        DynamicImage::ImageRgba8(solid)
+            .write_to(&mut Cursor::new(&mut solid_png), ImageFormat::Png)
+            .unwrap();
+
+        // Negative filter inverts RGB channels: (10, 20, 30) -> (245, 235, 225).
+        let neg_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                invert: true,
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let neg = transform(&solid_png, &neg_spec, &EngineLimits::default()).unwrap();
+        let neg_img = ImageReader::new(Cursor::new(&neg.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        assert_eq!(neg_img.get_pixel(4, 4).0, [245, 235, 225]);
+
+        // Grayscale + blur pipeline runs cleanly and yields equal R=G=B channels.
+        let gs_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                grayscale: true,
+                blur: Some("1.5".parse().unwrap()),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let gs = transform(&solid_png, &gs_spec, &EngineLimits::default()).unwrap();
+        let gs_img = ImageReader::new(Cursor::new(&gs.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let px = gs_img.get_pixel(8, 8).0;
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+    }
+
+    #[test]
+    fn monochrome_tint_maps_shadows_midtones_highlights_and_preserves_alpha() {
+        // 3x1 RGBA strip: pure black, exact mid-grey, pure white — all with alpha=180.
+        let mut strip = RgbaImage::new(3, 1);
+        strip.put_pixel(0, 0, Rgba([0, 0, 0, 180]));
+        strip.put_pixel(1, 0, Rgba([128, 128, 128, 180]));
+        strip.put_pixel(2, 0, Rgba([255, 255, 255, 180]));
+        let mut strip_png = Vec::new();
+        DynamicImage::ImageRgba8(strip)
+            .write_to(&mut Cursor::new(&mut strip_png), ImageFormat::Png)
+            .unwrap();
+
+        let brand: BackgroundColour = "1a73e8".parse().unwrap();
+        let spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                tint: Some(brand),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let out = transform(&strip_png, &spec, &EngineLimits::default()).unwrap();
+        let decoded = ImageReader::new(Cursor::new(&out.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgba8();
+
+        // Shadows stay black, midtones hit exact brand colour, highlights stay white; alpha intact.
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 180]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0x1a, 0x73, 0xe8, 180]);
+        assert_eq!(decoded.get_pixel(2, 0).0, [255, 255, 255, 180]);
+    }
+
+    #[test]
+    fn saturation_gamma_hue_and_sepia_transform_pixels_cleanly() {
+        use crate::domain::{Gamma, Hue, Saturation, Sepia};
+
+        let solid = RgbaImage::from_pixel(8, 8, Rgba([200, 100, 50, 255]));
+        let mut solid_png = Vec::new();
+        DynamicImage::ImageRgba8(solid)
+            .write_to(&mut Cursor::new(&mut solid_png), ImageFormat::Png)
+            .unwrap();
+
+        // Saturation -100 produces equal R=G=B channels.
+        let desat_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                saturation: Saturation::new(-100).unwrap(),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let desat = transform(&solid_png, &desat_spec, &EngineLimits::default()).unwrap();
+        let desat_img = ImageReader::new(Cursor::new(&desat.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .into_rgb8();
+        let px = desat_img.get_pixel(4, 4).0;
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+
+        // Gamma 2.0 brightens midtones; hue + sepia execute cleanly without panics.
+        let combo_spec = TransformSpec {
+            format: OutputFormat::Png,
+            filters: ImageFilters {
+                gamma: "2.0".parse::<Gamma>().unwrap(),
+                hue: Hue::new(90).unwrap(),
+                sepia: Sepia::new(75).unwrap(),
+                ..ImageFilters::default()
+            },
+            ..TransformSpec::default()
+        };
+        let combo = transform(&solid_png, &combo_spec, &EngineLimits::default()).unwrap();
+        assert!(!combo.bytes.is_empty());
     }
 }

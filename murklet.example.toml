@@ -18,6 +18,11 @@ diagnostic_headers = false
 [cache]
 dir = "./cache"
 max_entry_bytes = 52428800 # 50 MiB
+# Optional disk budget in bytes; oldest entries are evicted when exceeded.
+# max_total_bytes = 1073741824 # 1 GiB
+# Optional entry TTL in seconds; expired entries are evicted lazily and on sweeps.
+# ttl_secs = 2592000 # 30 days
+sweep_interval_secs = 300
 
 [limits]
 max_input_bytes = 52428800 # 50 MiB
@@ -39,6 +44,20 @@ allowed_hosts = []
 timeout_secs = 15
 connect_timeout_secs = 5
 max_redirects = 5
+
+[origins.s3]
+# S3-compatible object storage (AWS S3, Cloudflare R2, MinIO, RustFS, etc.).
+enabled = false
+bucket = ""
+region = "us-east-1"
+# endpoint = "https://<account>.r2.cloudflarestorage.com"
+# path_style = true
+# prefix = "uploads/"
+# Credentials default to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY when omitted.
+# access_key_id = ""
+# secret_access_key = ""
+timeout_secs = 15
+connect_timeout_secs = 5
 
 # Optional named transformation presets referenced via `?preset=<name>`.
 # [presets.thumb]

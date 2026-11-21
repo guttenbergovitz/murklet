@@ -9,7 +9,7 @@ pub mod signing;
 pub use config::{
     AnimationPolicyConfig, CacheConfig, DEFAULT_CACHE_CONTROL, DEFAULT_MAX_CONCURRENT_TRANSFORMS,
     HttpOriginSection, LimitsConfig, LocalOriginConfig, LogFormatConfig, MurkletConfig,
-    OriginsConfig, ServerConfig,
+    OriginsConfig, S3OriginSection, ServerConfig,
 };
 pub use error::PolicyError;
 pub use presets::{PresetConfig, PresetRegistry, ValidatedPreset};

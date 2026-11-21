@@ -27,12 +27,13 @@ use crate::http::metrics::{
 };
 use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
-use crate::origin::{HttpOrigin, LocalFsOrigin};
+use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
 use crate::policy::{DEFAULT_MAX_CONCURRENT_TRANSFORMS, PresetRegistry, RequestSigner};
 
 const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
+const S3_ORIGIN_ID: &str = "s3";
 
 /// Shared output of a cache-miss fetch and transformation, holding refcounted
 /// [`Bytes`] so coalesced followers share encoded payloads without copying.
@@ -56,6 +57,8 @@ pub struct AppState {
     pub local_origin: Option<LocalFsOrigin>,
     /// Optional HTTP(S) origin adapter (disabled by default unless configured with an allowlist).
     pub http_origin: Option<HttpOrigin>,
+    /// Optional S3-compatible object storage origin adapter.
+    pub s3_origin: Option<S3Origin>,
     /// Filesystem-backed variant cache.
     pub cache: FsCache,
     /// Resource limits and animation fallback policy for the image engine.
@@ -93,6 +96,7 @@ impl AppState {
         Self {
             local_origin,
             http_origin,
+            s3_origin: None,
             cache,
             engine_limits: EngineLimits::default(),
             max_target_dimension: DEFAULT_MAX_DIMENSION,
@@ -107,6 +111,13 @@ impl AppState {
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
             metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// Attaches an [`S3Origin`] for `s3://` asset requests.
+    #[must_use]
+    pub fn with_s3_origin(mut self, s3_origin: S3Origin) -> Self {
+        self.s3_origin = Some(s3_origin);
+        self
     }
 
     /// Sets the maximum number of concurrent CPU-bound image transformations.
@@ -322,6 +333,11 @@ fn resolve_origin_route(
             ));
         }
         Ok((HTTP_ORIGIN_ID, OriginKind::Http))
+    } else if is_s3_source(source) {
+        if state.s3_origin.is_none() {
+            return Err(HttpError::Forbidden("S3 origin is disabled".to_owned()));
+        }
+        Ok((S3_ORIGIN_ID, OriginKind::S3))
     } else {
         if state.local_origin.is_none() {
             return Err(HttpError::Forbidden(
@@ -390,6 +406,13 @@ async fn fetch_transform_and_cache(
             })?;
             http_origin.fetch(&source).await?
         }
+        OriginKind::S3 => {
+            let s3_origin = state
+                .s3_origin
+                .as_ref()
+                .ok_or_else(|| HttpError::Forbidden("S3 origin is disabled".to_owned()))?;
+            s3_origin.fetch(&source).await?
+        }
         OriginKind::Local => {
             let local_origin = state.local_origin.clone().ok_or_else(|| {
                 HttpError::Forbidden("local filesystem origin is disabled".to_owned())
@@ -452,6 +475,12 @@ fn is_http_source(source: &str) -> bool {
         || source
             .get(..8)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn is_s3_source(source: &str) -> bool {
+    source
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3://"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1145,6 +1174,7 @@ mod tests {
                 quality: Some(80),
                 format: Some("webp".to_owned()),
                 filter: None,
+                ..PresetConfig::default()
             },
         );
 

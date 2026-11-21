@@ -11,7 +11,7 @@ use crate::cache::CacheKey;
 use crate::domain::TransformSpec;
 use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
-use crate::origin::{HostAllowlist, validate_remote_url};
+use crate::origin::{HostAllowlist, validate_remote_url, validate_s3_key};
 use crate::policy::MurkletConfig;
 
 /// Result of explaining how Murklet would evaluate a `/load` request under a given config.
@@ -66,7 +66,7 @@ impl fmt::Display for ExplainReport {
                 writeln!(f, "Preset:    {}", preset.as_deref().unwrap_or("none"))?;
                 writeln!(
                     f,
-                    "Spec:      format={} quality={} width={} height={} filter={}",
+                    "Spec:      format={} quality={} width={} height={} fit={} gravity={} rotate={} filter={} bg={} filters={}",
                     spec.format,
                     spec.quality.get(),
                     spec.dimensions
@@ -75,8 +75,16 @@ impl fmt::Display for ExplainReport {
                     spec.dimensions
                         .height()
                         .map_or_else(|| "auto".to_owned(), |d| d.get().to_string()),
+                    spec.fit,
+                    spec.gravity,
+                    spec.rotation,
                     spec.filter
                         .map_or_else(|| "auto".to_owned(), |flt| flt.to_string()),
+                    spec.background.map_or_else(
+                        || "none".to_owned(),
+                        crate::domain::BackgroundColour::to_hex
+                    ),
+                    spec.filters,
                 )?;
                 writeln!(f, "Canonical: {}", spec.canonical_representation())?;
                 writeln!(
@@ -149,38 +157,9 @@ pub fn explain_load_request(
         parsed.spec.format = negotiate_format(accept_header);
     }
 
-    let is_remote = parsed
-        .source
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-        || parsed
-            .source
-            .get(..8)
-            .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-
-    let origin = if is_remote {
-        if !config.origins.http.enabled {
-            return ExplainReport::Denied {
-                reason: "remote HTTP(S) origins are disabled".to_owned(),
-            };
-        }
-        let allowlist = HostAllowlist::new(&config.origins.http.allowed_hosts);
-        if let Err(err) = validate_remote_url(&parsed.source, &allowlist, true) {
-            return ExplainReport::Denied {
-                reason: err.to_string(),
-            };
-        }
-        "http"
-    } else {
-        if !config.origins.local.enabled {
-            return ExplainReport::Denied {
-                reason: "local filesystem origin is disabled".to_owned(),
-            };
-        }
-        if let Err(reason) = validate_local_path_lexically(&parsed.source) {
-            return ExplainReport::Denied { reason };
-        }
-        "local"
+    let origin = match classify_and_validate_origin(config, &parsed.source) {
+        Ok(origin) => origin,
+        Err(reason) => return ExplainReport::Denied { reason },
     };
 
     let cache_key = CacheKey::from_parts(origin, &parsed.source, &parsed.spec);
@@ -200,6 +179,42 @@ pub fn explain_load_request(
         cache_key,
         signature_status,
         limits_summary,
+    }
+}
+
+fn classify_and_validate_origin(
+    config: &MurkletConfig,
+    source: &str,
+) -> Result<&'static str, String> {
+    let is_remote = source
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || source
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
+    let is_s3 = source
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("s3://"));
+
+    if is_remote {
+        if !config.origins.http.enabled {
+            return Err("remote HTTP(S) origins are disabled".to_owned());
+        }
+        let allowlist = HostAllowlist::new(&config.origins.http.allowed_hosts);
+        validate_remote_url(source, &allowlist, true).map_err(|err| err.to_string())?;
+        Ok("http")
+    } else if is_s3 {
+        if !config.origins.s3.enabled {
+            return Err("S3 origin is disabled".to_owned());
+        }
+        validate_s3_key(source).map_err(|err| err.to_string())?;
+        Ok("s3")
+    } else {
+        if !config.origins.local.enabled {
+            return Err("local filesystem origin is disabled".to_owned());
+        }
+        validate_local_path_lexically(source)?;
+        Ok("local")
     }
 }
 
@@ -223,6 +238,23 @@ fn decode_raw_query(raw_query: &str) -> RawLoadQuery {
             "q" => out.q = Some(value.into_owned()),
             "f" => out.f = Some(value.into_owned()),
             "filter" => out.filter = Some(value.into_owned()),
+            "fit" => out.fit = Some(value.into_owned()),
+            "gravity" => out.gravity = Some(value.into_owned()),
+            "rotate" => out.rotate = Some(value.into_owned()),
+            "dpr" => out.dpr = Some(value.into_owned()),
+            "bg" => out.bg = Some(value.into_owned()),
+            "flip" => out.flip = Some(value.into_owned()),
+            "grayscale" | "greyscale" => out.grayscale = Some(value.into_owned()),
+            "invert" | "negative" => out.invert = Some(value.into_owned()),
+            "blur" => out.blur = Some(value.into_owned()),
+            "sharpen" => out.sharpen = Some(value.into_owned()),
+            "brightness" => out.brightness = Some(value.into_owned()),
+            "contrast" => out.contrast = Some(value.into_owned()),
+            "saturation" => out.saturation = Some(value.into_owned()),
+            "hue" => out.hue = Some(value.into_owned()),
+            "gamma" => out.gamma = Some(value.into_owned()),
+            "sepia" => out.sepia = Some(value.into_owned()),
+            "tint" | "mono" | "monochrome" => out.tint = Some(value.into_owned()),
             _ => {}
         }
     }
