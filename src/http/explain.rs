@@ -9,7 +9,7 @@ use url::form_urlencoded;
 
 use crate::cache::CacheKey;
 use crate::domain::TransformSpec;
-use crate::http::negotiate::negotiate_format;
+use crate::http::negotiate::negotiate_format_allowed;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HostAllowlist, validate_remote_url, validate_s3_key};
 use crate::policy::MurkletConfig;
@@ -24,7 +24,7 @@ pub enum ExplainReport {
         /// Optional matched preset name.
         preset: Option<String>,
         /// Resolved canonical transformation specification.
-        spec: TransformSpec,
+        spec: Box<TransformSpec>,
         /// Whether `Vary: Accept` would be emitted.
         vary_accept: bool,
         /// Resulting canonical [`CacheKey`].
@@ -33,6 +33,8 @@ pub enum ExplainReport {
         signature_status: &'static str,
         /// Summary of active limits.
         limits_summary: String,
+        /// Summary of active per-origin policy.
+        policy_summary: String,
     },
     /// Request would be rejected before fetching or transforming.
     Denied {
@@ -60,6 +62,7 @@ impl fmt::Display for ExplainReport {
                 cache_key,
                 signature_status,
                 limits_summary,
+                policy_summary,
             } => {
                 writeln!(f, "Decision:  ALLOWED")?;
                 writeln!(f, "Origin:    {origin}")?;
@@ -97,6 +100,7 @@ impl fmt::Display for ExplainReport {
                     cache_key.file_name()
                 )?;
                 writeln!(f, "Signature: {signature_status}")?;
+                writeln!(f, "Policy:    {policy_summary}")?;
                 write!(f, "Limits:    {limits_summary}")
             }
             Self::Denied { reason } => write!(f, "Decision:  DENIED\nReason:    {reason}"),
@@ -112,68 +116,74 @@ pub fn explain_load_request(
     input: &str,
     accept_header: Option<&str>,
 ) -> ExplainReport {
+    match explain_load_request_inner(config, input, accept_header) {
+        Ok(report) => report,
+        Err(reason) => ExplainReport::Denied { reason },
+    }
+}
+
+fn explain_load_request_inner(
+    config: &MurkletConfig,
+    input: &str,
+    accept_header: Option<&str>,
+) -> Result<ExplainReport, String> {
     let raw_query = extract_query_string(input);
 
-    let signature_status = match config.request_signer() {
-        Ok(Some(signer)) => {
+    let signature_status = match config.request_signer().map_err(|err| err.to_string())? {
+        Some(signer) => {
             if signer.verify_raw_query(raw_query) {
                 "valid (HMAC-SHA256)"
             } else {
-                return ExplainReport::Denied {
-                    reason: "invalid or missing HMAC-SHA256 'sig' parameter".to_owned(),
-                };
+                return Err("invalid or missing HMAC-SHA256 'sig' parameter".to_owned());
             }
         }
-        Ok(None) => "not required",
-        Err(err) => {
-            return ExplainReport::Denied {
-                reason: err.to_string(),
-            };
-        }
+        None => "not required",
     };
 
-    let presets = match config.preset_registry() {
-        Ok(registry) => registry,
-        Err(err) => {
-            return ExplainReport::Denied {
-                reason: err.to_string(),
-            };
-        }
-    };
+    let presets = config.preset_registry().map_err(|err| err.to_string())?;
+    let origin_policies = config.origin_policies().map_err(|err| err.to_string())?;
 
     let parsed_raw = decode_raw_query(raw_query);
-    let mut parsed = match parse_load_query_with_presets(
-        parsed_raw,
-        config.limits.max_target_dimension,
-        &presets,
-    ) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return ExplainReport::Denied {
-                reason: format!("{err:?}"),
-            };
-        }
-    };
+    let source_preview = parsed_raw
+        .url
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "query parameter 'url' is required".to_owned())?;
+
+    let origin = classify_and_validate_origin(config, source_preview)?;
+    let origin_policy = origin_policies.for_origin_id(origin);
+    enforce_explain_origin_policy(&parsed_raw, origin, origin_policy)?;
+
+    let effective_max_dim =
+        origin_policy.effective_max_dimension(config.limits.max_target_dimension);
+    let mut parsed = parse_load_query_with_presets(parsed_raw, effective_max_dim, &presets)
+        .map_err(|err| format!("{err:?}"))?;
 
     let vary_accept = config.server.accept_negotiation && !parsed.explicit_format;
     if vary_accept {
-        parsed.spec.format = negotiate_format(accept_header);
+        parsed.spec.format =
+            negotiate_format_allowed(accept_header, &origin_policy.allowed_formats);
     }
-
+    if !origin_policy.is_format_allowed(parsed.spec.format) {
+        return Err(format!(
+            "output format '{}' is not permitted for origin '{origin}'",
+            parsed.spec.format
+        ));
+    }
+    if parsed.spec.watermark.is_none() {
+        parsed.spec.watermark = origin_policy.default_watermark_spec();
+    }
     if let Some(ref wm) = parsed.spec.watermark
         && !config.watermarks.contains_key(&wm.name)
     {
-        return ExplainReport::Denied {
-            reason: format!("unknown watermark '{}'", wm.name),
-        };
+        return Err(format!("unknown watermark '{}'", wm.name));
     }
 
-    let origin = match classify_and_validate_origin(config, &parsed.source) {
-        Ok(origin) => origin,
-        Err(reason) => return ExplainReport::Denied { reason },
-    };
-
     let cache_key = CacheKey::from_parts(origin, &parsed.source, &parsed.spec);
+    let policy_summary = origin_policy.summary(
+        config.limits.max_target_dimension,
+        &config.server.cache_control,
+    );
     let limits_summary = format!(
         "max_input={}B max_src_dim={} max_pixels={} max_concurrent={}",
         config.limits.max_input_bytes,
@@ -182,15 +192,44 @@ pub fn explain_load_request(
         config.limits.max_concurrent_transforms
     );
 
-    ExplainReport::Allowed {
+    Ok(ExplainReport::Allowed {
         origin,
         preset: parsed.preset,
-        spec: parsed.spec,
+        spec: Box::new(parsed.spec),
         vary_accept,
         cache_key,
         signature_status,
         limits_summary,
+        policy_summary,
+    })
+}
+
+fn enforce_explain_origin_policy(
+    raw: &RawLoadQuery,
+    origin: &str,
+    policy: &crate::policy::OriginPolicy,
+) -> Result<(), String> {
+    let preset_name = raw.preset.as_deref().filter(|v| !v.is_empty());
+    if policy.presets_only {
+        if preset_name.is_none() {
+            return Err(format!(
+                "origin '{origin}' policy requires a named 'preset' parameter (presets_only)"
+            ));
+        }
+        if raw.has_transform_overrides() {
+            return Err(format!(
+                "ad-hoc transformation parameters are forbidden by origin '{origin}' policy (presets_only)"
+            ));
+        }
     }
+    if let Some(name) = preset_name
+        && !policy.is_preset_allowed(name)
+    {
+        return Err(format!(
+            "preset '{name}' is not permitted for origin '{origin}'"
+        ));
+    }
+    Ok(())
 }
 
 fn classify_and_validate_origin(
@@ -392,5 +431,47 @@ brand = "./assets/logo.png"
 
         let denied = explain_load_request(&cfg, "/load?url=photo.jpg&wm=missing", None);
         assert!(!denied.is_allowed());
+    }
+
+    #[test]
+    fn explains_per_origin_presets_only_and_format_restrictions() {
+        let cfg = MurkletConfig::from_toml_str(
+            r#"
+[presets.thumb]
+width = 300
+format = "webp"
+
+[presets.raw_jpg]
+width = 300
+format = "jpeg"
+
+[origins.local.policy]
+presets_only = true
+allowed_presets = ["thumb"]
+allowed_formats = ["webp", "avif"]
+cache_control = "public, max-age=600"
+"#,
+        )
+        .unwrap();
+
+        let ok = explain_load_request(&cfg, "/load?url=photo.jpg&preset=thumb", None);
+        assert!(ok.is_allowed());
+        assert!(ok.to_string().contains("presets_only=true"));
+        assert!(
+            ok.to_string()
+                .contains("cache_control=\"public, max-age=600\"")
+        );
+
+        // Ad-hoc query without preset denied.
+        assert!(!explain_load_request(&cfg, "/load?url=photo.jpg&w=300", None).is_allowed());
+        // Ad-hoc override combined with preset denied under presets_only.
+        assert!(
+            !explain_load_request(&cfg, "/load?url=photo.jpg&preset=thumb&w=100", None)
+                .is_allowed()
+        );
+        // Disallowed preset denied.
+        assert!(
+            !explain_load_request(&cfg, "/load?url=photo.jpg&preset=raw_jpg", None).is_allowed()
+        );
     }
 }

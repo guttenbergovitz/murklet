@@ -86,6 +86,46 @@ pub struct RawLoadQuery {
     pub wm_scale: Option<String>,
 }
 
+impl RawLoadQuery {
+    /// Reports whether any non-empty ad-hoc transformation query parameter is present
+    /// (excluding `url` and `preset`). Used to enforce per-origin `presets_only` policy.
+    #[must_use]
+    pub fn has_transform_overrides(&self) -> bool {
+        let non_empty = |opt: &Option<String>| opt.as_deref().is_some_and(|v| !v.is_empty());
+        non_empty(&self.w)
+            || non_empty(&self.h)
+            || non_empty(&self.q)
+            || non_empty(&self.f)
+            || non_empty(&self.filter)
+            || non_empty(&self.fit)
+            || non_empty(&self.gravity)
+            || non_empty(&self.rotate)
+            || non_empty(&self.dpr)
+            || non_empty(&self.bg)
+            || non_empty(&self.flip)
+            || non_empty(&self.grayscale)
+            || non_empty(&self.invert)
+            || non_empty(&self.blur)
+            || non_empty(&self.sharpen)
+            || non_empty(&self.brightness)
+            || non_empty(&self.contrast)
+            || non_empty(&self.saturation)
+            || non_empty(&self.hue)
+            || non_empty(&self.gamma)
+            || non_empty(&self.sepia)
+            || non_empty(&self.tint)
+            || non_empty(&self.duotone)
+            || non_empty(&self.posterize)
+            || non_empty(&self.threshold)
+            || non_empty(&self.pixelate)
+            || non_empty(&self.vignette)
+            || non_empty(&self.wm)
+            || non_empty(&self.wm_pos)
+            || non_empty(&self.wm_opacity)
+            || non_empty(&self.wm_scale)
+    }
+}
+
 /// Validated `GET /load` request ready for cache lookup and origin fetching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLoadRequest {

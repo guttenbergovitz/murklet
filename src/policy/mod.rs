@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod error;
+pub mod origin_policy;
 pub mod presets;
 pub mod signing;
 
@@ -13,5 +14,6 @@ pub use config::{
     SourceCacheConfig,
 };
 pub use error::PolicyError;
+pub use origin_policy::{OriginPolicies, OriginPolicy, OriginPolicyConfig};
 pub use presets::{PresetConfig, PresetRegistry, ValidatedPreset};
 pub use signing::{RequestSigner, canonicalise_query_for_signing};
