@@ -59,15 +59,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Constructs application state backed by a local filesystem origin and cache.
-    ///
-    /// Remote HTTP(S) fetching is disabled by default; attach an allowlisted
-    /// [`HttpOrigin`] via [`Self::with_http_origin`] to enable it.
+    /// Constructs application state from explicit optional origins and a cache.
     #[must_use]
-    pub fn new(local_origin: LocalFsOrigin, cache: FsCache) -> Self {
+    pub fn from_parts(
+        local_origin: Option<LocalFsOrigin>,
+        http_origin: Option<HttpOrigin>,
+        cache: FsCache,
+    ) -> Self {
         Self {
-            local_origin: Some(local_origin),
-            http_origin: None,
+            local_origin,
+            http_origin,
             cache,
             engine_limits: EngineLimits::default(),
             max_target_dimension: DEFAULT_MAX_DIMENSION,
@@ -76,6 +77,15 @@ impl AppState {
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
         }
+    }
+
+    /// Constructs application state backed by a local filesystem origin and cache.
+    ///
+    /// Remote HTTP(S) fetching is disabled by default; attach an allowlisted
+    /// [`HttpOrigin`] via [`Self::with_http_origin`] to enable it.
+    #[must_use]
+    pub fn new(local_origin: LocalFsOrigin, cache: FsCache) -> Self {
+        Self::from_parts(Some(local_origin), None, cache)
     }
 
     /// Attaches an allowlisted [`HttpOrigin`] for remote `http://` and `https://` requests.
