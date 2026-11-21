@@ -61,7 +61,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let request_signer = config.request_signer()?;
 
-    let mut state = AppState::from_parts(local_origin, http_origin, cache);
+    let mut state = AppState::from_parts(local_origin, http_origin, cache)
+        .with_max_concurrent_transforms(config.limits.max_concurrent_transforms);
     state.engine_limits = config.engine_limits();
     state.max_target_dimension = config.limits.max_target_dimension;
     state.cache_control = config.server.cache_control;

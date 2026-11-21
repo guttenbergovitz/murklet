@@ -12,10 +12,15 @@ use crate::engine::{
     AnimationPolicy, DEFAULT_MAX_DECODED_PIXELS, DEFAULT_MAX_INPUT_BYTES,
     DEFAULT_MAX_SOURCE_DIMENSION, EngineLimits,
 };
-use crate::http::DEFAULT_CACHE_CONTROL;
 use crate::origin::{DEFAULT_MAX_REDIRECTS, HostAllowlist, HttpOriginConfig};
 use crate::policy::error::PolicyError;
 use crate::policy::signing::RequestSigner;
+
+/// Default `Cache-Control` header applied to served image variants.
+pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+/// Default upper bound on concurrent CPU-bound image transformations.
+pub const DEFAULT_MAX_CONCURRENT_TRANSFORMS: usize = 8;
 
 /// Top-level validated Murklet service and policy configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -109,6 +114,9 @@ pub struct LimitsConfig {
     /// Maximum decoded pixel count (`width * height`) allowed before full decode.
     #[serde(default = "default_max_decoded_pixels")]
     pub max_decoded_pixels: u64,
+    /// Maximum number of concurrent CPU-bound image transformations (backpressure guard).
+    #[serde(default = "default_max_concurrent_transforms")]
+    pub max_concurrent_transforms: usize,
     /// Fallback policy for animated GIF/WebP inputs.
     #[serde(default)]
     pub animation_policy: AnimationPolicyConfig,
@@ -121,6 +129,7 @@ impl Default for LimitsConfig {
             max_source_dimension: default_max_source_dimension(),
             max_target_dimension: default_max_target_dimension(),
             max_decoded_pixels: default_max_decoded_pixels(),
+            max_concurrent_transforms: default_max_concurrent_transforms(),
             animation_policy: AnimationPolicyConfig::FirstFrame,
         }
     }
@@ -336,6 +345,11 @@ impl MurkletConfig {
                 "limits.max_decoded_pixels must be greater than zero".to_owned(),
             ));
         }
+        if self.limits.max_concurrent_transforms == 0 {
+            return Err(PolicyError::Validation(
+                "limits.max_concurrent_transforms must be greater than zero".to_owned(),
+            ));
+        }
 
         if !self.origins.local.enabled && !self.origins.http.enabled {
             return Err(PolicyError::Validation(
@@ -398,6 +412,10 @@ const fn default_max_target_dimension() -> u32 {
 
 const fn default_max_decoded_pixels() -> u64 {
     DEFAULT_MAX_DECODED_PIXELS
+}
+
+const fn default_max_concurrent_transforms() -> usize {
+    DEFAULT_MAX_CONCURRENT_TRANSFORMS
 }
 
 const fn default_true() -> bool {

@@ -132,6 +132,7 @@ impl HttpOrigin {
         let resolver = Arc::new(SafeDnsResolver { enforce_ip_block });
 
         let client = Client::builder()
+            .user_agent(concat!("murklet/", env!("CARGO_PKG_VERSION")))
             .redirect(Policy::none())
             .connect_timeout(config.connect_timeout)
             .timeout(config.timeout)

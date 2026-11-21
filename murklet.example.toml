@@ -22,6 +22,7 @@ max_input_bytes = 52428800 # 50 MiB
 max_source_dimension = 16384
 max_target_dimension = 8192
 max_decoded_pixels = 64000000
+max_concurrent_transforms = 8
 # Fallback for multi-frame GIF/WebP inputs: "first_frame" or "passthrough"
 animation_policy = "first_frame"
 

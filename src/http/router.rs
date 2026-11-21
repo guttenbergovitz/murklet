@@ -10,29 +10,35 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use bytes::Bytes;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag};
-use crate::domain::{DEFAULT_MAX_DIMENSION, TransformSpec};
-use crate::engine::{self, EngineLimits, TransformOutput};
+use crate::domain::{
+    DEFAULT_MAX_DIMENSION, ImageDimensions, OutputFormat, SelectedFilter, TransformSpec,
+};
+use crate::engine::{self, EngineLimits};
 use crate::http::error::HttpError;
 use crate::http::negotiate::negotiate_format;
 use crate::http::query::{RawLoadQuery, parse_load_query};
 use crate::origin::{HttpOrigin, LocalFsOrigin};
-use crate::policy::RequestSigner;
-
-/// Default `Cache-Control` header applied to served image variants.
-pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+pub use crate::policy::DEFAULT_CACHE_CONTROL;
+use crate::policy::{DEFAULT_MAX_CONCURRENT_TRANSFORMS, RequestSigner};
 
 const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
 
-/// Shared output of a cache-miss fetch and transformation, wrapped in `Arc` so
-/// coalesced followers share encoded bytes without redundant copying.
+/// Shared output of a cache-miss fetch and transformation, holding refcounted
+/// [`Bytes`] so coalesced followers share encoded payloads without copying.
 #[derive(Debug)]
 struct MissOutcome {
-    output: TransformOutput,
+    bytes: Bytes,
+    format: OutputFormat,
+    source_dimensions: ImageDimensions,
+    output_dimensions: ImageDimensions,
+    filter: SelectedFilter,
     original_size: usize,
     etag: String,
 }
@@ -64,6 +70,7 @@ pub struct AppState {
     /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
+    transform_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -86,7 +93,15 @@ impl AppState {
             accept_negotiation: false,
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
+            transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
         }
+    }
+
+    /// Sets the maximum number of concurrent CPU-bound image transformations.
+    #[must_use]
+    pub fn with_max_concurrent_transforms(mut self, max_concurrent: usize) -> Self {
+        self.transform_permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
+        self
     }
 
     /// Constructs application state backed by a local filesystem origin and cache.
@@ -169,7 +184,7 @@ async fn load_handler(
         }
 
         return Ok(build_image_response(
-            cached.bytes,
+            Bytes::from(cached.bytes),
             cached.format.mime_type(),
             &cached.etag,
             &state.cache_control,
@@ -242,20 +257,20 @@ fn build_miss_response(
     }
 
     let diagnostics = (!was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
-        original_width: outcome.output.source_dimensions.width(),
-        original_height: outcome.output.source_dimensions.height(),
-        processed_width: outcome.output.output_dimensions.width(),
-        processed_height: outcome.output.output_dimensions.height(),
+        original_width: outcome.source_dimensions.width(),
+        original_height: outcome.source_dimensions.height(),
+        processed_width: outcome.output_dimensions.width(),
+        processed_height: outcome.output_dimensions.height(),
         original_size: outcome.original_size,
-        processed_size: outcome.output.bytes.len(),
-        format: outcome.output.format.as_str(),
+        processed_size: outcome.bytes.len(),
+        format: outcome.format.as_str(),
         quality: requested_quality,
-        filter: outcome.output.filter.to_string(),
+        filter: outcome.filter.to_string(),
     });
 
     build_image_response(
-        outcome.output.bytes.clone(),
-        outcome.output.format.mime_type(),
+        outcome.bytes.clone(),
+        outcome.format.mime_type(),
         &outcome.etag,
         &state.cache_control,
         x_cache,
@@ -289,6 +304,12 @@ async fn fetch_transform_and_cache(
 
     let original_size = fetched.bytes.len();
 
+    // Bound concurrent CPU/memory-intensive image decoding and encoding.
+    let _permit = Arc::clone(&state.transform_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| HttpError::Internal)?;
+
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
         let output = engine::transform(&fetched.bytes, &spec, &state.engine_limits)?;
 
@@ -308,7 +329,11 @@ async fn fetch_transform_and_cache(
         };
 
         Ok(Arc::new(MissOutcome {
-            output,
+            bytes: Bytes::from(output.bytes),
+            format: output.format,
+            source_dimensions: output.source_dimensions,
+            output_dimensions: output.output_dimensions,
+            filter: output.filter,
             original_size,
             etag,
         }))
@@ -395,7 +420,7 @@ fn build_not_modified_response(
 }
 
 fn build_image_response(
-    bytes: Vec<u8>,
+    bytes: Bytes,
     mime_type: &'static str,
     etag: &str,
     cache_control: &str,
