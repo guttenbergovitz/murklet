@@ -1,0 +1,87 @@
+version: "3"
+
+vars:
+  CONFIG: '{{.CONFIG | default "murklet.toml"}}'
+  BASE_URL: '{{.BASE_URL | default "http://127.0.0.1:9876"}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  fmt:
+    desc: Format all Rust source files
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Verify Rust formatting matches rustfmt
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Run Clippy with strict workspace lints
+    cmds:
+      - cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    desc: Run the full Rust test suite
+    cmds:
+      - cargo test --locked
+
+  check:
+    desc: Run the full CI quality gate (format, clippy, and tests)
+    deps:
+      - fmt:check
+      - lint
+      - test
+
+  config:check:
+    desc: Validate a Murklet TOML configuration without starting the server
+    cmds:
+      - cargo run --locked -- --check {{.CONFIG}}
+
+  dev:init:
+    desc: Prepare local murklet.toml and assets directory if absent
+    cmds:
+      - test -f {{.CONFIG}} || cp murklet.example.toml {{.CONFIG}}
+      - mkdir -p assets
+
+  dev:
+    desc: Start Murklet locally using murklet.toml
+    deps:
+      - dev:init
+    cmds:
+      - cargo run --locked -- {{.CONFIG}}
+
+  smoke:
+    desc: Run an HTTP smoke test (healthz, MISS, HIT, and 304 Not Modified) against a running server
+    cmds:
+      - |
+        set -eu
+        echo "==> GET /healthz"
+        curl -fsS "{{.BASE_URL}}/healthz"
+        echo ""
+
+        if [ ! -f assets/smoke.png ]; then
+          echo "==> Creating 1x1 PNG fixture at assets/smoke.png"
+          mkdir -p assets
+          printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > assets/smoke.png
+        fi
+
+        echo "==> 1st GET /load (expect X-Cache: MISS)"
+        headers=$(curl -fsS -D - -o /dev/null "{{.BASE_URL}}/load?url=smoke.png&w=16&f=webp")
+        printf '%s\n' "$headers" | grep -iE '^(HTTP/|content-type:|etag:|cache-control:|x-cache:)'
+        etag=$(printf '%s\n' "$headers" | awk 'tolower($1)=="etag:" {sub(/\r$/, "", $2); print $2}')
+
+        echo "==> 2nd GET /load (expect X-Cache: HIT)"
+        curl -fsS -D - -o /dev/null "{{.BASE_URL}}/load?url=smoke.png&w=16&f=webp" | grep -iE '^(HTTP/|content-type:|etag:|x-cache:)'
+
+        echo "==> 3rd GET /load with If-None-Match (expect 304 Not Modified)"
+        curl -sS -D - -o /dev/null -H "If-None-Match: $etag" "{{.BASE_URL}}/load?url=smoke.png&w=16&f=webp" | grep -iE '^(HTTP/|etag:|x-cache:)'
+
+  docker:build:
+    desc: Build the local Murklet container image
+    cmds:
+      - docker build -t murklet:local .

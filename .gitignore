@@ -3,9 +3,11 @@
 **/*.rs.bk
 *.pdb
 
-# Local runtime cache directories
+# Local runtime cache, sample assets, and local configuration
 /cache/
 /.cache/
+/assets/
+/murklet.toml
 
 # Local environment and secrets
 .env
