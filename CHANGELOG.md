@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-11-22
+
+### Added
+
+- **Streaming budget & cancellation stress tests (`src/origin/http.rs`, `tests/pressure_stress.rs`, `docs/adr/0004-resource-isolation-and-invalidation-semantics.md`):** Added a chunked slow-HTTP origin test verifying mid-stream `OriginError::BudgetExhausted` rejection and zero leaked bytes, added a mixed cancellation/overload stress test confirming all `murklet_in_flight_*` gauges settle cleanly to `0`, and updated ADR 0004 with the incremental streaming budget, `spawn_blocking` permit binding, and explicit invalidation contract.
+
 ## [0.9.0] - 2026-11-22
 
 ### Changed

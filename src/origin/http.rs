@@ -397,4 +397,53 @@ mod tests {
             Err(OriginError::TooManyRedirects { max: 2 })
         );
     }
+
+    #[tokio::test]
+    async fn fetch_with_budget_aborts_streaming_http_response_before_buffering_over_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        // Raw chunked HTTP/1.1 server with no Content-Length streaming 8 KiB in 2 KiB chunks.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut req_buf).await;
+                let headers =
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                if socket.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk_payload = vec![b'A'; 2048];
+                for _ in 0..4 {
+                    let header = format!("{:x}\r\n", chunk_payload.len());
+                    if socket.write_all(header.as_bytes()).await.is_err()
+                        || socket.write_all(&chunk_payload).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+
+        let origin = local_test_origin(64 * 1024, 2);
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        // Tight 4 KiB budget: 8 KiB chunked stream must abort mid-stream with BudgetExhausted.
+        let budget = crate::origin::ByteBudget::new(4096, Arc::clone(&live_bytes));
+        let mut reservation = budget.begin(Duration::from_millis(50));
+
+        let err = origin
+            .fetch_with_budget(&format!("http://{addr}/stream.bin"), &mut reservation)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OriginError::BudgetExhausted);
+
+        drop(reservation);
+        assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 4);
+    }
 }

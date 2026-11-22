@@ -15,14 +15,16 @@ Separately, `POST /cache/purge?url=<source>` and `POST /cache/cleanup` deleted f
 1. **Four-stage resource isolation (`[limits]`):** Split backpressure across four independent, observable guards enforced in `src/application/load.rs`:
    - **Pending admission (`max_pending_transforms`):** Non-blocking `try_acquire` before touching any origin so excess cache-miss load sheds immediately with `503 Retry-After`.
    - **Origin fetch concurrency (`max_concurrent_fetches`):** Bounded semaphore held only for the duration of the origin read (local, HTTP(S), or S3).
-   - **In-flight source memory budget (`max_in_flight_source_bytes`):** KiB-granularity semaphore permits acquired for raw source payloads and held until transformation drops the source buffer.
+   - **In-flight source memory budget (`max_in_flight_source_bytes`):** KiB-granularity semaphore permits (`ByteBudget` / `ByteReservation`) reserved *before* buffer pre-allocation (`metadata.len()` / `Content-Length`) and incrementally *before* appending each streamed chunk, updating `murklet_in_flight_source_bytes` live and releasing immediately after transformation.
    - **Transform concurrency (`max_concurrent_transforms`):** Bounded semaphore protecting CPU and decoded-pixel memory during `spawn_blocking` execution.
-   Each rejection increments `murklet_backpressure_rejections_total{reason=...}` alongside RAII gauges for in-flight fetches, source bytes, and transforms.
+   All permits (`pending`, `transform`, `ByteReservation`) and RAII metric guards are moved *into* the `spawn_blocking` closure so client cancellation mid-transform cannot release concurrency or memory slots while CPU-bound encoding is still running.
+   Each rejection increments `murklet_backpressure_rejections_total{reason=...}` alongside RAII gauges for in-flight fetches, source bytes, and transforms, while `murklet_transform_duration_seconds` measures CPU transform duration inside `spawn_blocking`.
 
 2. **Linearisable in-memory invalidation epochs (`src/cache/invalidation.rs`):**
    - Each cache-miss acquires an RAII `FlightToken` before reading from origin, recording the global cleanup epoch and per-source generation.
    - `POST /cache/purge` and `POST /cache/cleanup` advance the relevant generation and hold an exclusive `RwLock` I/O gate while deleting files on disk.
    - Variant and raw-source cache writes hold a shared `RwLock` read gate and verify that their `FlightToken` is still current before writing; stale flights skip disk persistence without blocking concurrent writers.
+   - **Explicit invalidation contract:** `POST /cache/purge` guarantees that existing cached files are deleted and that no request started before the purge can repopulate stale entries on disk. Callers whose requests were already in flight when the purge ran may still finish receiving their in-progress response rather than forcing an automatic retry.
    - Tracking entries are removed automatically when the last `FlightToken` for a source drops, keeping memory bounded to active flights.
 
 3. **Explicit cache-error observability:** Filesystem cache read/write errors still degrade gracefully to origin rather than failing requests with `500`, but emit `tracing::warn!` logs and increment `murklet_cache_errors_total{cache,op}`.
