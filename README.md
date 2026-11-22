@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** `v0.9.1` (early release). Implemented and tested: local filesystem, SSRF-hardened HTTP(S), and pure-Rust S3-compatible (`SigV4`) origins; per-origin transformation and delivery policies (`[origins.<kind>.policy]` with `presets_only`, preset/format allowlists, dimension caps, default watermarks, and `Cache-Control` overrides); pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), fit/cover/contain/scale-down cropping with gravity & focal points, rotation, DPR, alpha flattening, post-resize colour/tonal/monochrome & creative filters (`duotone`, `posterize`, `threshold`, `pixelate`, `vignette`), and policy-controlled watermarks (`[watermarks]`); source-bucketed filesystem variant & optional raw-source cache with request coalescing, TTL expiry, disk-budget eviction, and $O(1)$ selective per-source invalidation (`POST /cache/purge`); transform queue backpressure (`503 Retry-After`); declarative TOML configuration with named presets, `murklet explain`, `murklet test-policy`, and `murklet sign`; optional HMAC-SHA256 request signing; `Accept` format negotiation; structured `tracing` logs; Prometheus `/metrics`; and Criterion benchmarks. Path-based URL routes and OpenTelemetry exporters remain planned.
+> **Project status:** `v0.9.1` (early release). Implemented and tested: local filesystem, SSRF-hardened HTTP(S), and pure-Rust S3-compatible (`SigV4`) origins; per-origin transformation and delivery policies (`[origins.<kind>.policy]` with `presets_only`, preset/format allowlists, dimension caps, default watermarks, and `Cache-Control` overrides); pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), fit/cover/contain/scale-down cropping with gravity & focal points, rotation, DPR, alpha flattening, post-resize colour/tonal/monochrome & creative filters (`duotone`, `posterize`, `threshold`, `pixelate`, `vignette`), and policy-controlled watermarks (`[watermarks]`); source-bucketed filesystem variant & optional raw-source cache with request coalescing, TTL expiry, disk-budget eviction, $O(1)$ selective per-source invalidation (`POST /cache/purge`) guarded by linearisable invalidation epochs, and explicit cache-error telemetry; four-stage resource isolation (`max_pending_transforms`, `max_concurrent_fetches`, pre-allocation/streaming `max_in_flight_source_bytes`, and cancellation-safe `max_concurrent_transforms` returning `503 Retry-After`); declarative TOML configuration with named presets, `murklet explain`, `murklet test-policy`, and `murklet sign`; optional HMAC-SHA256 request signing; `Accept` format negotiation; structured `tracing` logs; Prometheus `/metrics`; pressure/cancellation stress tests (`task stress`), deterministic boundary-fuzz tests, and Criterion benchmarks (`task bench`). Path-based URL routes and OpenTelemetry exporters remain planned.
 
 ## Motivation
 
@@ -58,7 +58,7 @@ Murklet is not tied to S3. The origin interface supports different source types 
 
 - **Origin isolation:** Deny-by-default remote origins, strict host allowlists (`exact` and `*.domain`), and optional constant-time HMAC-SHA256 request signing (`server.signing_secret` + `murklet sign`).
 - **SSRF and path-traversal defences:** IPv4, IPv6, IPv4-mapped, and NAT64 private/loopback/link-local/metadata range blocking, DNS IP pinning across redirects, and canonicalised filesystem containment.
-- **Decompression-bomb and resource guards:** Header-level source dimension and decoded-pixel checks before allocation, bounded streaming reads (`max_input_bytes`), and separate backpressure limits for pending cache-miss admission (`max_pending_transforms`), origin fetch concurrency (`max_concurrent_fetches`), aggregate in-flight source memory (`max_in_flight_source_bytes`), and CPU-bound transform concurrency (`max_concurrent_transforms`) returning `503 Service Unavailable` with `Retry-After` (see [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
+- **Decompression-bomb and resource guards:** Header-level source dimension and decoded-pixel checks before allocation, bounded streaming reads (`max_input_bytes`), and four-stage backpressure — pending cache-miss admission (`max_pending_transforms`), origin fetch concurrency (`max_concurrent_fetches`), pre-allocation/incremental streaming source memory (`max_in_flight_source_bytes`), and cancellation-safe CPU transform concurrency (`max_concurrent_transforms`) bound to `spawn_blocking` lifetime — returning `503 Service Unavailable` with `Retry-After` (see [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
 - **Memory safety:** `#![forbid(unsafe_code)]` across the crate and a pure-Rust default image pipeline (see [ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md)).
 
 ### Policies, verification, and observability
@@ -174,13 +174,13 @@ Preset expansion + Accept negotiation + canonical variant key
      |
 Variant cache lookup ------ hit ------> HTTP response (200 / 304)
      |
-    miss (coalesced per variant key)
+    miss (coalesced per variant key; pending admission guard)
      |
-Raw-source cache / coalesced origin fetch (Local / HTTP(S) / S3)
+Raw-source cache / coalesced origin fetch (fetch concurrency + streaming byte budget)
      |
-Header guard -> decode -> crop/resize -> filters -> watermark -> encode
+Transform permit -> spawn_blocking (header guard -> decode -> crop/resize -> filters -> watermark -> encode)
      |
-Atomic cache write
+Invalidation-epoch-guarded atomic cache write
      |
 HTTP response
 ```
@@ -209,7 +209,10 @@ Rust is an implementation choice, not a substitute for architectural discipline 
 | **0.4 — S3, geometry, filters & eviction** | Released | Pure-Rust S3-compatible (`SigV4`) origin, fit/crop/gravity/focal-point/rotation/DPR/alpha flattening, post-resize colour & monochrome filters, and cache TTL + disk-budget eviction sweeps. |
 | **0.5 — Creative filters, watermarks & hardening** | Released | Creative filters (`duotone`, `posterize`, `threshold`, `pixelate`, `vignette`), startup-loaded `[watermarks]`, raw-source cache (`[cache.source]`), transform queue backpressure (`503 Retry-After`), and `murklet sign`. |
 | **0.6 — Policy-first control & cache invalidation** | Released | Per-origin policies (`[origins.<kind>.policy]` with `presets_only`), source-bucketed $O(1)$ selective cache purge (`POST /cache/purge`), and declarative CI policy test runner (`murklet test-policy`) per [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md). |
-| **0.7+ — Interoperability & telemetry** | Planned | Optional path-based URL routes, OpenTelemetry trace export, migration ergonomics for established proxy URL formats, and comparative benchmarks. |
+| **0.7 — Resource isolation, invalidation epochs & architecture** | Released | Cache error metrics (`murklet_cache_errors_total`), bounded fetch/pending/memory limits (`max_concurrent_fetches`, `max_pending_transforms`, `max_in_flight_source_bytes`), linearisable `InvalidationTracker` epochs against purge-vs-write races, `application::load` orchestration split, and `cache_evict` Criterion benchmarks. |
+| **0.8 — Pressure observability, stress & fuzz hardening** | Released | Backpressure rejection counters (`murklet_backpressure_rejections_total`), live in-flight fetch/byte gauges, reproducible pressure stress tests (`task stress`), deterministic boundary-fuzz tests (`tests/boundary_fuzz.rs`), SSRF backslash/control-char hardening, cancellation-safe `spawn_blocking` permits, accurate CPU transform duration histogram, and [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md). |
+| **0.9 — Pre-allocation streaming memory budgets** | Released | `ByteBudget` / `ByteReservation` enforced before buffer pre-allocation and incrementally per streamed HTTP/S3/local chunk, chunked slow-HTTP abort verification, mixed cancellation/overload stress suite, and explicit purge contract. |
+| **0.10+ — Interoperability & telemetry** | Planned | Optional path-based URL routes, OpenTelemetry trace export, migration ergonomics for established proxy URL formats, and comparative benchmarks. |
 
 ## Non-goals
 
@@ -238,8 +241,11 @@ cargo run -- test-policy policy-tests.toml murklet.toml
 # Generate a signed /load URL when server.signing_secret is configured
 cargo run -- sign "/load?url=sample.png&w=400&f=webp" murklet.toml
 
-# Run reproducible image-engine benchmarks
+# Run reproducible image-engine and cache-eviction benchmarks
 task bench
+
+# Run pressure and concurrency stress tests (stampede, backpressure, cancellation, purge)
+task stress
 ```
 
 Or run Cargo directly:
@@ -274,13 +280,13 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cle
 To build a minimal container image:
 
 ```bash
-docker build -t murklet:0.6.0 .
+docker build -t murklet:0.9.1 .
 ```
 
 ## Documentation
 
 - [Engineering and Git Conventions](docs/conventions.md) — coding standards, Git Flow, SemVer, and commit guidelines.
-- [Architecture Decision Records](docs/adr/README.md) — lightweight record of key technical decisions ([ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md), [ADR 0002](docs/adr/0002-single-crate-module-boundaries.md), [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md)).
+- [Architecture Decision Records](docs/adr/README.md) — lightweight record of key technical decisions ([ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md), [ADR 0002](docs/adr/0002-single-crate-module-boundaries.md), [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md), [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
 - [Example Configuration](murklet.example.toml) — annotated TOML policy reference.
 - [Changelog](CHANGELOG.md) — release history.
 
