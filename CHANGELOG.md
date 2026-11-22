@@ -4,6 +4,16 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.6] - 2026-11-22
+
+### Fixed
+
+- **Truncated `Content-Length` detection (`src/origin/http.rs`, `src/origin/s3.rs`):** Explicitly verify `bytes.len() == expected` after streaming completes when `Content-Length` is declared, returning `OriginError::Io` on truncated responses and covering the path with a deterministic raw-socket HTTP truncation test.
+
+### Documentation
+
+- **Heavy 12 MP RSS benchmarks and realistic sizing guidance (`docs/benchmarks.md`):** Added `4000×3000` (12 MP) filter + watermark + JPEG/AVIF RSS/CPU/latency measurements (peaking at `269.3 MiB` JPEG and `375.0 MiB` AVIF at 4 concurrent transforms) and replaced the simple source-budget multiplier with separate raw-source, decoded-pixel/encoder, and allocator-retention sizing guidance.
+
 ## [0.9.5] - 2026-11-22
 
 ### Fixed

@@ -1,8 +1,8 @@
 # Empirical Benchmarks and Resource Sizing
 
-This document records reproducible measurements of Murklet (`v0.9.5`, `--release`) under concurrent transformation pressure, overload backpressure, and filesystem cache eviction. All numbers are baseline single-host measurements on Apple Silicon macOS (local NVMe SSD) and are intended to verify resource-isolation invariants and guide operator capacity planning rather than serve as marketing claims.
+This document records reproducible measurements of Murklet (`v0.9.5`/`v0.9.6`, `--release`) under concurrent transformation pressure, overload backpressure, high-megapixel filter/watermark pipelines, and filesystem cache eviction. All numbers are baseline single-host measurements on Apple Silicon macOS (local NVMe SSD) and are intended to verify behaviour under specific workloads and guide operator capacity planning rather than serve as universal worst-case guarantees.
 
-## 1. Live process pressure test (RSS, CPU, latency, and backpressure)
+## 1. Live process pressure test — 1.92 MP assets (RSS, CPU, latency, and backpressure)
 
 ### Test setup
 
@@ -27,13 +27,25 @@ This document records reproducible measurements of Murklet (`v0.9.5`, `--release
 | **AVIF overload** (`1600×1200 → 640w`, `q=65`) | 24 distinct / 24 (`pending=12`) | `12` / `12` | 1437.7 | 2187.7 | 2190.4 | **157.2 MiB** | **401.6%** |
 | **Warm cache HIT** (8 variants) | 200 / 32 | `200` / `0` | 5.2 | 10.2 | 11.9 | **157.2 MiB** | 273.5% |
 
-### Observed invariants and sizing guidance
+## 2. Heavy 12 MP pipeline (large decoded frames + filters + watermark + AVIF)
 
-1. **CPU isolation matches `max_concurrent_transforms`:** Under 24 concurrent AVIF requests with `max_concurrent_transforms = 4` and `max_pending_transforms = 12`, peak CPU capped at `401.6%` (~4 cores), exactly 12 excess requests shed immediately with `503 Retry-After` (`murklet_backpressure_rejections_total{reason="pending_queue"} 12`), and the remaining 12 completed with `200 OK`.
-2. **Process RSS vs `max_in_flight_source_bytes`:** With a `64 MiB` raw source byte budget, peak process RSS reached `~111 MiB` for JPEG, `~129 MiB` for WebP/PNG, and `~157 MiB` for 4 concurrent AVIF (`rav1e`) encoders. As a rule of thumb, provision container memory for **`2.0–2.5×` `max_in_flight_source_bytes`** plus decoded pixel headroom (`max_concurrent_transforms × max_decoded_pixels × 4 bytes`) and allocator high-water-mark retention.
+To measure decoded-pixel, filter, and encoder memory when compressed inputs are small on disk relative to decoded frame size, 8 distinct `4000×3000` (12 MP, ~48 MiB decoded RGBA each, ~368 KiB compressed PNG on disk) assets were processed concurrently at `max_concurrent_transforms = 4` with `max_in_flight_source_bytes = 64 MiB`:
+
+| Workload | Requests / concurrency | `200` / `503` | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS | Peak CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **12 MP → 1600w JPEG** (`duotone` + `blur=1.5` + `vignette=30` + `wm=brand`) | 8 distinct / 4 | `8` / `0` | 148.7 | 177.9 | 178.4 | **269.3 MiB** | 218.5% |
+| **12 MP → 1200w AVIF** (`blur=1.5` + `vignette=30` + `wm=brand`, `q=65`) | 8 distinct / 4 | `8` / `0` | 1054.4 | 1083.0 | 1090.3 | **375.0 MiB** | **400.7%** |
+
+### Observed behaviour and sizing guidance
+
+1. **Observed CPU behaviour under tested workloads:** In both AVIF tests at `max_concurrent_transforms = 4`, peak CPU stayed near `~401%` (~4 cores) and excess requests beyond `max_pending_transforms = 12` shed immediately with `503 Retry-After` (`murklet_backpressure_rejections_total{reason="pending_queue"} 12`). This confirms that the transform semaphore bounds active blocking tasks for the tested pure-Rust encoders, though it is not a hard OS-level CPU quota (e.g. cgroups).
+2. **Decoded pixels and encoder contexts dominate RSS on large images:** On the 12 MP workload, raw in-flight source payloads totalled under `2 MiB`, yet peak RSS reached **`269.3 MiB`** (JPEG + filters + watermark) and **`375.0 MiB`** (AVIF + filters + watermark). Do **not** size container memory as a simple multiple of `max_in_flight_source_bytes`. Instead, budget both components independently:
+   - raw source queue (`max_in_flight_source_bytes`), **plus**
+   - concurrent transform working set (`max_concurrent_transforms × (max_decoded_pixels × 4 bytes + filter/resize intermediates + encoder context — notably ~30–40 MiB per concurrent AVIF encoder)`), **plus**
+   - allocator high-water-mark retention (system allocators such as macOS `malloc` / glibc `ptmalloc` typically retain peak arenas rather than returning them immediately to the OS).
 3. **Zero resource leaks:** After every workload, all in-flight Prometheus gauges (`murklet_in_flight_transforms`, `murklet_in_flight_fetches`, `murklet_in_flight_source_bytes`) returned to `0`.
 
-## 2. Filesystem cache eviction (`benches/cache_evict.rs`)
+## 3. Filesystem cache eviction (`benches/cache_evict.rs`)
 
 Measured via `cargo bench --bench cache_evict -- --quick`:
 

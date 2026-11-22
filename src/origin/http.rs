@@ -277,6 +277,14 @@ impl HttpOrigin {
             }
 
             drop(streaming_gate);
+            if let Some(expected) = content_length
+                && bytes.len() != expected
+            {
+                return Err(OriginError::Io(
+                    "upstream response body was truncated before declared Content-Length"
+                        .to_owned(),
+                ));
+            }
             if let Some(res) = reservation.as_deref_mut() {
                 res.shrink_to(bytes.len());
             }
@@ -611,5 +619,41 @@ mod tests {
         }
         assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(budget.semaphore().available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_http_response_shorter_than_content_length() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        // Raw HTTP/1.1 server declaring Content-Length: 4096 but closing after 1024 bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut req_buf).await;
+                let headers =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(&vec![b'X'; 1024]).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let origin = local_test_origin(64 * 1024, 2);
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        let budget = crate::origin::ByteBudget::new(8192, Arc::clone(&live_bytes));
+        let mut reservation = budget.begin(Duration::from_millis(200));
+
+        let err = origin
+            .fetch_with_budget(&format!("http://{addr}/truncated.png"), &mut reservation)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OriginError::Io(_)));
+
+        drop(reservation);
+        assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 8);
     }
 }
