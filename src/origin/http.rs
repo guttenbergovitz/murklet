@@ -257,6 +257,13 @@ impl HttpOrigin {
                 .map_err(|err| map_reqwest_error(&err))?
             {
                 let new_len = bytes.len().saturating_add(chunk.len());
+                if let Some(expected) = content_length
+                    && new_len > expected
+                {
+                    return Err(OriginError::Io(
+                        "upstream response body exceeded declared Content-Length".to_owned(),
+                    ));
+                }
                 if new_len > self.max_bytes {
                     return Err(OriginError::PayloadTooLarge {
                         size: new_len,
@@ -513,6 +520,94 @@ mod tests {
         for handle in handles {
             let len = handle.await.unwrap().unwrap();
             assert_eq!(len, 3072);
+        }
+        assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn slow_chunked_streams_release_streaming_gate_on_timeout_and_let_others_complete() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        // Raw chunked HTTP/1.1 server: `/tarpit` stalls after 1 KiB; `/slow-*` delivers 3 KiB.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut req_buf = [0u8; 512];
+                        let n = tokio::io::AsyncReadExt::read(&mut socket, &mut req_buf)
+                            .await
+                            .unwrap_or(0);
+                        let req_head = String::from_utf8_lossy(&req_buf[..n]);
+                        let is_tarpit = req_head.contains("/tarpit");
+                        let headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        if socket.write_all(headers.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if is_tarpit {
+                            let chunk = vec![b'T'; 1024];
+                            let _ = socket.write_all(b"400\r\n").await;
+                            let _ = socket.write_all(&chunk).await;
+                            let _ = socket.write_all(b"\r\n").await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        } else {
+                            for size in [2048usize, 1024usize] {
+                                let chunk = vec![b'S'; size];
+                                let header = format!("{size:x}\r\n");
+                                if socket.write_all(header.as_bytes()).await.is_err()
+                                    || socket.write_all(&chunk).await.is_err()
+                                    || socket.write_all(b"\r\n").await.is_err()
+                                {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            let _ = socket.write_all(b"0\r\n\r\n").await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let mut cfg = HttpOriginConfig::new(HostAllowlist::new(["127.0.0.1"]), 64 * 1024);
+        cfg.timeout = Duration::from_millis(120);
+        cfg.allow_private_ips_for_testing = true;
+        let origin = Arc::new(HttpOrigin::new(cfg).unwrap());
+
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        let budget = crate::origin::ByteBudget::new(4096, Arc::clone(&live_bytes));
+
+        let tarpit = {
+            let origin = Arc::clone(&origin);
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                let mut res = budget.begin(Duration::from_millis(800));
+                origin
+                    .fetch_with_budget(&format!("http://{addr}/tarpit"), &mut res)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let mut healthy = Vec::new();
+        for idx in 0..2 {
+            let origin = Arc::clone(&origin);
+            let budget = budget.clone();
+            healthy.push(tokio::spawn(async move {
+                let mut res = budget.begin(Duration::from_millis(800));
+                origin
+                    .fetch_with_budget(&format!("http://{addr}/slow-{idx}"), &mut res)
+                    .await
+            }));
+        }
+
+        assert_eq!(tarpit.await.unwrap(), Err(OriginError::Timeout));
+        for handle in healthy {
+            let fetched = handle.await.unwrap().unwrap();
+            assert_eq!(fetched.bytes.len(), 3072);
         }
         assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(budget.semaphore().available_permits(), 4);
