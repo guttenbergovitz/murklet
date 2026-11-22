@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] - 2026-11-22
+
+### Changed
+
+- **Application orchestration extracted from HTTP router (`src/application/load.rs`, `src/http/router.rs`):** Moved policy resolution, cache lookup, singleflight coalescing, resource-isolation guards, origin fetching, image transformation, and cache invalidation orchestration out of `src/http/router.rs` into `src/application/load.rs`. `src/http/router.rs` now handles HTTP transport concerns only (routing, authentication checks, `ETag`/`If-None-Match`, diagnostic headers, and response formatting) while re-exporting `AppState` for backwards compatibility.
+
 ## [0.7.1] - 2026-11-22
 
 ### Fixed
