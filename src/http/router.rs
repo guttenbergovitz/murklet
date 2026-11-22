@@ -1296,7 +1296,7 @@ mod tests {
             .acquire_owned()
             .await
             .unwrap();
-        let pending_resp = build_router(pending_state)
+        let pending_resp = build_router(Arc::clone(&pending_state))
             .oneshot(
                 Request::builder()
                     .uri("/load?url=sample.png&w=40&f=jpeg")
@@ -1307,6 +1307,12 @@ mod tests {
             .unwrap();
         assert_eq!(pending_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(pending_resp.headers().get("retry-after").unwrap(), "2");
+        assert!(
+            pending_state
+                .metrics
+                .render_prometheus()
+                .contains("murklet_backpressure_rejections_total{reason=\"pending_queue\"} 1\n")
+        );
         drop(held_pending);
 
         // 2. Saturated fetch permits time out with 503 Retry-After.
@@ -1317,7 +1323,7 @@ mod tests {
             .acquire_owned()
             .await
             .unwrap();
-        let fetch_resp = build_router(fetch_state)
+        let fetch_resp = build_router(Arc::clone(&fetch_state))
             .oneshot(
                 Request::builder()
                     .uri("/load?url=sample.png&w=40&f=jpeg")
@@ -1328,6 +1334,12 @@ mod tests {
             .unwrap();
         assert_eq!(fetch_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(fetch_resp.headers().get("retry-after").unwrap(), "2");
+        assert!(
+            fetch_state
+                .metrics
+                .render_prometheus()
+                .contains("murklet_backpressure_rejections_total{reason=\"fetch_timeout\"} 1\n")
+        );
         drop(held_fetch);
 
         // 3. Saturated in-flight source byte budget times out with 503 Retry-After.
@@ -1338,7 +1350,7 @@ mod tests {
             .acquire_many_owned(1)
             .await
             .unwrap();
-        let byte_resp = build_router(byte_state)
+        let byte_resp = build_router(Arc::clone(&byte_state))
             .oneshot(
                 Request::builder()
                     .uri("/load?url=sample.png&w=40&f=jpeg")
@@ -1349,6 +1361,12 @@ mod tests {
             .unwrap();
         assert_eq!(byte_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(byte_resp.headers().get("retry-after").unwrap(), "2");
+        assert!(
+            byte_state
+                .metrics
+                .render_prometheus()
+                .contains("murklet_backpressure_rejections_total{reason=\"byte_budget\"} 1\n")
+        );
     }
 
     #[tokio::test]

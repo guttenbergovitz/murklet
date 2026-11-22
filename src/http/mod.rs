@@ -12,7 +12,8 @@ pub mod router;
 pub use error::HttpError;
 pub use explain::{ExplainReport, explain_load_request};
 pub use metrics::{
-    CacheOp, CacheOutcome, CacheTier, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
+    BackpressureReason, CacheOp, CacheOutcome, CacheTier, Metrics, OriginKind,
+    PROMETHEUS_CONTENT_TYPE, StatusClass,
 };
 pub use negotiate::negotiate_format;
 pub use policy_test::{

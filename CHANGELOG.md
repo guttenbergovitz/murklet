@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-11-22
+
+### Added
+
+- **Backpressure rejection counters and in-flight resource gauges (`src/http/metrics.rs`, `src/application/load.rs`):** Exposed `murklet_backpressure_rejections_total{reason="pending_queue|fetch_timeout|byte_budget|transform_timeout"}` alongside RAII-tracked `murklet_in_flight_fetches` and `murklet_in_flight_source_bytes` gauges on `GET /metrics` so operators can distinguish which resource limit triggered `503 Service Unavailable`.
+
 ## [0.7.3] - 2026-11-22
 
 ### Added

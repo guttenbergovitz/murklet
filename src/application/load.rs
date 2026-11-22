@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::engine::{self, EngineLimits, WatermarkRegistry};
 use crate::http::error::HttpError;
-use crate::http::metrics::{CacheOp, CacheTier, Metrics, OriginKind};
+use crate::http::metrics::{BackpressureReason, CacheOp, CacheTier, Metrics, OriginKind};
 use crate::http::negotiate::negotiate_format_allowed;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
@@ -511,6 +511,13 @@ fn enforce_origin_query_policy(
     Ok(())
 }
 
+fn reject_backpressure(state: &AppState, reason: BackpressureReason) -> HttpError {
+    state.metrics.record_backpressure_rejection(reason);
+    HttpError::ServiceUnavailable {
+        retry_after_secs: 2,
+    }
+}
+
 async fn fetch_transform_and_cache(
     state: Arc<AppState>,
     origin_id: &'static str,
@@ -525,9 +532,7 @@ async fn fetch_transform_and_cache(
     // queue waiting for CPU transform slots stays strictly bounded.
     let _pending_permit = Arc::clone(&state.pending_transform_permits)
         .try_acquire_owned()
-        .map_err(|_| HttpError::ServiceUnavailable {
-            retry_after_secs: 2,
-        })?;
+        .map_err(|_| reject_backpressure(&state, BackpressureReason::PendingQueue))?;
 
     // Capture the source's invalidation epoch before fetching so a concurrent
     // `POST /cache/purge` or `POST /cache/cleanup` prevents stale writes to disk.
@@ -540,19 +545,16 @@ async fn fetch_transform_and_cache(
     // Account for raw source bytes held in memory until transformation drops them.
     let source_kib = bytes_to_kib_permits(original_size);
     if source_kib > state.in_flight_source_budget_kib {
-        return Err(HttpError::ServiceUnavailable {
-            retry_after_secs: 2,
-        });
+        return Err(reject_backpressure(&state, BackpressureReason::ByteBudget));
     }
     let _byte_permit = tokio::time::timeout(
         state.transform_queue_timeout,
         Arc::clone(&state.in_flight_byte_permits).acquire_many_owned(source_kib),
     )
     .await
-    .map_err(|_| HttpError::ServiceUnavailable {
-        retry_after_secs: 2,
-    })?
+    .map_err(|_| reject_backpressure(&state, BackpressureReason::ByteBudget))?
     .map_err(|_| HttpError::Internal)?;
+    let _in_flight_bytes = state.metrics.track_in_flight_source_bytes(original_size);
 
     // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
     // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
@@ -561,9 +563,7 @@ async fn fetch_transform_and_cache(
         Arc::clone(&state.transform_permits).acquire_owned(),
     )
     .await
-    .map_err(|_| HttpError::ServiceUnavailable {
-        retry_after_secs: 2,
-    })?
+    .map_err(|_| reject_backpressure(&state, BackpressureReason::TransformTimeout))?
     .map_err(|_| HttpError::Internal)?;
     let _in_flight = state.metrics.track_in_flight();
 
@@ -641,6 +641,7 @@ async fn fetch_source_bytes(
 ) -> Result<Bytes, HttpError> {
     if origin_kind == OriginKind::Local {
         let _fetch_permit = acquire_fetch_permit(state).await?;
+        let _fetch_guard = state.metrics.track_in_flight_fetch();
         let local_origin = state.local_origin.clone().ok_or_else(|| {
             HttpError::Forbidden("local filesystem origin is disabled".to_owned())
         })?;
@@ -666,6 +667,7 @@ async fn fetch_source_bytes(
             let flight_for_put = Arc::clone(flight);
             async move {
                 let fetch_permit = acquire_fetch_permit(&state).await?;
+                let fetch_guard = state.metrics.track_in_flight_fetch();
                 let fetched = match origin_kind {
                     OriginKind::Http => {
                         let http_origin = state.http_origin.as_ref().ok_or_else(|| {
@@ -681,6 +683,7 @@ async fn fetch_source_bytes(
                     }
                     OriginKind::Local => return Err(HttpError::Internal),
                 };
+                drop(fetch_guard);
                 drop(fetch_permit);
 
                 let bytes = Bytes::from(fetched.bytes);
@@ -701,8 +704,13 @@ async fn acquire_fetch_permit(
         Arc::clone(&state.fetch_permits).acquire_owned(),
     )
     .await
-    .map_err(|_| HttpError::ServiceUnavailable {
-        retry_after_secs: 2,
+    .map_err(|_| {
+        state
+            .metrics
+            .record_backpressure_rejection(BackpressureReason::FetchTimeout);
+        HttpError::ServiceUnavailable {
+            retry_after_secs: 2,
+        }
     })?
     .map_err(|_| HttpError::Internal)
 }

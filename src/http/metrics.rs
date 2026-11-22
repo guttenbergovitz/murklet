@@ -192,6 +192,46 @@ impl CacheOp {
     }
 }
 
+/// Low-cardinality backpressure rejection reason label for `murklet_backpressure_rejections_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressureReason {
+    /// Admission rejected immediately because `limits.max_pending_transforms` was full.
+    PendingQueue,
+    /// Timed out waiting for an origin fetch slot (`limits.max_concurrent_fetches`).
+    FetchTimeout,
+    /// Rejected or timed out waiting for raw source byte budget (`limits.max_in_flight_source_bytes`).
+    ByteBudget,
+    /// Timed out waiting for a CPU transform slot (`limits.max_concurrent_transforms`).
+    TransformTimeout,
+}
+
+impl BackpressureReason {
+    const ALL: [Self; 4] = [
+        Self::PendingQueue,
+        Self::FetchTimeout,
+        Self::ByteBudget,
+        Self::TransformTimeout,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::PendingQueue => 0,
+            Self::FetchTimeout => 1,
+            Self::ByteBudget => 2,
+            Self::TransformTimeout => 3,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingQueue => "pending_queue",
+            Self::FetchTimeout => "fetch_timeout",
+            Self::ByteBudget => "byte_budget",
+            Self::TransformTimeout => "transform_timeout",
+        }
+    }
+}
+
 const ALL_FORMATS: [OutputFormat; 5] = [
     OutputFormat::Jpeg,
     OutputFormat::Png,
@@ -216,11 +256,14 @@ pub struct Metrics {
     load_requests: [[AtomicU64; 4]; 4],
     transforms: [[AtomicU64; 5]; 3],
     in_flight_transforms: AtomicUsize,
+    in_flight_fetches: AtomicUsize,
+    in_flight_source_bytes: AtomicUsize,
     transform_buckets: [AtomicU64; 10],
     transform_count: AtomicU64,
     transform_sum_micros: AtomicU64,
     cache_cleanups: AtomicU64,
     cache_errors: [[AtomicU64; 2]; 2],
+    backpressure_rejections: [AtomicU64; 4],
 }
 
 /// RAII guard tracking an active image transformation in [`Metrics::in_flight_transforms`].
@@ -233,6 +276,33 @@ impl Drop for InFlightGuard {
         self.metrics
             .in_flight_transforms
             .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard tracking an active origin fetch in [`Metrics::in_flight_fetches`].
+pub struct InFlightFetchGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for InFlightFetchGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .in_flight_fetches
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard tracking raw source bytes held in memory in [`Metrics::in_flight_source_bytes`].
+pub struct InFlightBytesGuard {
+    metrics: Arc<Metrics>,
+    bytes: usize,
+}
+
+impl Drop for InFlightBytesGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .in_flight_source_bytes
+            .fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -275,6 +345,28 @@ impl Metrics {
         }
     }
 
+    /// Increments `murklet_in_flight_fetches` and returns an RAII guard that
+    /// decrements the gauge when dropped.
+    #[must_use]
+    pub fn track_in_flight_fetch(self: &Arc<Self>) -> InFlightFetchGuard {
+        self.in_flight_fetches.fetch_add(1, Ordering::Relaxed);
+        InFlightFetchGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    /// Adds `bytes` to `murklet_in_flight_source_bytes` and returns an RAII guard
+    /// that subtracts `bytes` when dropped.
+    #[must_use]
+    pub fn track_in_flight_source_bytes(self: &Arc<Self>, bytes: usize) -> InFlightBytesGuard {
+        self.in_flight_source_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        InFlightBytesGuard {
+            metrics: Arc::clone(self),
+            bytes,
+        }
+    }
+
     /// Increments `murklet_cache_cleanups_total`.
     pub fn record_cache_cleanup(&self) {
         self.cache_cleanups.fetch_add(1, Ordering::Relaxed);
@@ -283,6 +375,11 @@ impl Metrics {
     /// Increments `murklet_cache_errors_total` for the given cache tier and operation.
     pub fn record_cache_error(&self, tier: CacheTier, op: CacheOp) {
         self.cache_errors[tier.index()][op.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments `murklet_backpressure_rejections_total` for the given rejection reason.
+    pub fn record_backpressure_rejection(&self, reason: BackpressureReason) {
+        self.backpressure_rejections[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Renders all metrics in Prometheus text exposition format (`v0.0.4`).
@@ -329,6 +426,16 @@ impl Metrics {
         out.push_str("# TYPE murklet_in_flight_transforms gauge\n");
         let _ = writeln!(out, "murklet_in_flight_transforms {in_flight}");
 
+        let in_flight_fetches = self.in_flight_fetches.load(Ordering::Relaxed);
+        out.push_str("# HELP murklet_in_flight_fetches Currently executing origin fetches.\n");
+        out.push_str("# TYPE murklet_in_flight_fetches gauge\n");
+        let _ = writeln!(out, "murklet_in_flight_fetches {in_flight_fetches}");
+
+        let in_flight_bytes = self.in_flight_source_bytes.load(Ordering::Relaxed);
+        out.push_str("# HELP murklet_in_flight_source_bytes Raw source payload bytes currently held in memory awaiting or undergoing transformation.\n");
+        out.push_str("# TYPE murklet_in_flight_source_bytes gauge\n");
+        let _ = writeln!(out, "murklet_in_flight_source_bytes {in_flight_bytes}");
+
         let total_count = self.transform_count.load(Ordering::Relaxed);
         let sum_micros = self.transform_sum_micros.load(Ordering::Relaxed);
         let sum_secs_whole = sum_micros / 1_000_000;
@@ -356,6 +463,12 @@ impl Metrics {
             "murklet_transform_duration_seconds_count {total_count}"
         );
 
+        self.render_cache_and_backpressure_metrics(&mut out);
+
+        out
+    }
+
+    fn render_cache_and_backpressure_metrics(&self, out: &mut String) {
         let cleanups = self.cache_cleanups.load(Ordering::Relaxed);
         out.push_str("# HELP murklet_cache_cleanups_total Total successful POST /cache/cleanup executions.\n");
         out.push_str("# TYPE murklet_cache_cleanups_total counter\n");
@@ -377,7 +490,18 @@ impl Metrics {
             }
         }
 
-        out
+        out.push_str("# HELP murklet_backpressure_rejections_total Total 503 backpressure rejections by resource-limit reason.\n");
+        out.push_str("# TYPE murklet_backpressure_rejections_total counter\n");
+        for reason in BackpressureReason::ALL {
+            let count = self.backpressure_rejections[reason.index()].load(Ordering::Relaxed);
+            if count > 0 {
+                let _ = writeln!(
+                    out,
+                    "murklet_backpressure_rejections_total{{reason=\"{}\"}} {count}",
+                    reason.as_str()
+                );
+            }
+        }
     }
 }
 
@@ -399,14 +523,24 @@ mod tests {
         metrics.record_cache_cleanup();
         metrics.record_cache_error(CacheTier::Variant, CacheOp::Read);
         metrics.record_cache_error(CacheTier::Source, CacheOp::Write);
+        metrics.record_backpressure_rejection(BackpressureReason::PendingQueue);
+        metrics.record_backpressure_rejection(BackpressureReason::ByteBudget);
 
         let guard = metrics.track_in_flight();
+        let fetch_guard = metrics.track_in_flight_fetch();
+        let bytes_guard = metrics.track_in_flight_source_bytes(4096);
         let during = metrics.render_prometheus();
         assert!(during.contains("murklet_in_flight_transforms 1\n"));
+        assert!(during.contains("murklet_in_flight_fetches 1\n"));
+        assert!(during.contains("murklet_in_flight_source_bytes 4096\n"));
         drop(guard);
+        drop(fetch_guard);
+        drop(bytes_guard);
 
         let after = metrics.render_prometheus();
         assert!(after.contains("murklet_in_flight_transforms 0\n"));
+        assert!(after.contains("murklet_in_flight_fetches 0\n"));
+        assert!(after.contains("murklet_in_flight_source_bytes 0\n"));
         assert!(after.contains("murklet_load_requests_total{cache=\"miss\",status=\"200\"} 1\n"));
         assert!(after.contains("murklet_load_requests_total{cache=\"hit\",status=\"304\"} 1\n"));
         assert!(after.contains("murklet_transforms_total{origin=\"local\",format=\"webp\"} 1\n"));
@@ -417,5 +551,11 @@ mod tests {
         assert!(after.contains("murklet_cache_cleanups_total 1\n"));
         assert!(after.contains("murklet_cache_errors_total{cache=\"variant\",op=\"read\"} 1\n"));
         assert!(after.contains("murklet_cache_errors_total{cache=\"source\",op=\"write\"} 1\n"));
+        assert!(
+            after.contains("murklet_backpressure_rejections_total{reason=\"pending_queue\"} 1\n")
+        );
+        assert!(
+            after.contains("murklet_backpressure_rejections_total{reason=\"byte_budget\"} 1\n")
+        );
     }
 }
