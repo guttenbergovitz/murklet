@@ -60,9 +60,18 @@ Directory scanning scales roughly linearly (~22 ms per 1,000 cached files on loc
 ## Reproducing locally
 
 ```bash
-# Image-engine and cache-eviction Criterion benchmarks
+# Criterion benchmarks: image engine and cache eviction
 task bench
+
+# Live release build: RSS, CPU, p50/p95/p99, and backpressure (sections 1 and 2 above)
+task bench:live                     # 1.92 MP standard profile
+task bench:live PROFILE=heavy       # 12 MP + filters + watermark profile
 
 # Deterministic stampede, backpressure, cancellation, and purge stress suite
 task stress
 ```
+
+The live harness is [scripts/bench/live_pressure.py](../scripts/bench/live_pressure.py). It needs only Python 3 and a release binary (`MURKLET_BIN` overrides the default `target/release/murklet`), generates its own PNG fixtures, and samples RSS and CPU through `ps`. Absolute numbers depend on hardware, operating system, and allocator, so compare runs on the same machine.
+
+> [!NOTE]
+> The tables above were recorded with an earlier ad-hoc fixture generator. The committed harness builds more repetitive (more compressible) images, so its RSS and latency figures come out lower (for example roughly 95 MiB peak for the standard AVIF overload case instead of 157 MiB), while the qualitative behaviour is the same: CPU capped near four cores, exactly 12 requests shed with `reason="pending_queue"`, and all gauges back at zero. Treat the tables as indicative samples and re-measure with your own images.

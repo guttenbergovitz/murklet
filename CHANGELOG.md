@@ -4,6 +4,27 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Operations guide (`docs/operations.md`) and documentation index (`docs/README.md`):** Container usage, `503` reasons mapped to the limit to tune, memory sizing, cache and purge contract, and a metrics reference.
+- **Reproducible live benchmark harness (`scripts/bench/live_pressure.py`, `task bench:live`):** The RSS/CPU/latency measurements in `docs/benchmarks.md` can now be regenerated from the repository (`standard` and `heavy` profiles).
+- **Example policy test suite (`policy-tests.example.toml`):** Replaces a README reference to a file that did not exist.
+- **Developer tasks:** `task doc`, `task build`, `task clean`, `task docker:run`; `task check` now includes rustdoc.
+- **CI:** rustdoc build with warnings denied, plus validation of `murklet.example.toml` and `policy-tests.example.toml`.
+
+### Changed
+
+- **README:** Condensed the project-status paragraph, removed per-release version pins that went stale, and linked the new guides.
+- **Dockerfile:** The bundled configuration now binds `0.0.0.0:9876` so a published container port is reachable (the example file binds loopback).
+
+### Fixed
+
+- **Minimum supported Rust version (`Cargo.toml`, `Dockerfile`, `README.md`):** The code uses `let` chains, which require Rust 1.88, but `1.85` was declared and used as the container builder image. The declared MSRV and builder image are now `1.88`.
+- **Container image build (`Dockerfile`):** The dependency-cache layer failed because `Cargo.toml` declares `[[bench]]` targets whose files were not present. Empty stubs are now created for that layer and kept for the final build, so the image builds again.
+- **Broken rustdoc links (`src/http/metrics.rs`):** Public guard documentation linked to private metrics fields.
+
 ## [0.9.6] - 2026-11-22
 
 ### Fixed

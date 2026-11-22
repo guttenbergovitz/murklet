@@ -2,7 +2,7 @@
 name = "murklet"
 version = "0.9.6"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Image proxy and on-demand image transformation service."
 publish = false
 

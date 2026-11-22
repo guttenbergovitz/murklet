@@ -44,5 +44,15 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Build API documentation
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Validate example configuration and policy suite
+        run: |
+          cargo run --locked -- --check murklet.example.toml
+          cargo run --locked -- test-policy policy-tests.example.toml murklet.example.toml
+
       - name: Run tests
         run: cargo test --locked

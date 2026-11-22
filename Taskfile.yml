@@ -41,11 +41,36 @@ tasks:
       - cargo bench --locked
 
   check:
-    desc: Run the full CI quality gate (format, clippy, and tests)
+    desc: Run the full CI quality gate (format, clippy, rustdoc, and tests)
     deps:
       - fmt:check
       - lint
+      - doc
       - test
+
+  doc:
+    desc: Build API documentation and fail on broken intra-doc links
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    cmds:
+      - cargo doc --no-deps --locked
+
+  build:
+    desc: Build an optimised release binary
+    cmds:
+      - cargo build --release --locked
+
+  clean:
+    desc: Remove build artefacts (the local cache directory is left untouched)
+    cmds:
+      - cargo clean
+
+  bench:live:
+    desc: "Measure RSS, CPU, and latency of a live release build (PROFILE=standard|heavy)"
+    deps:
+      - build
+    cmds:
+      - python3 scripts/bench/live_pressure.py --profile {{.PROFILE | default "standard"}}
 
   config:check:
     desc: Validate a Murklet TOML configuration without starting the server
@@ -102,3 +127,8 @@ tasks:
     desc: Build the local Murklet container image
     cmds:
       - docker build -t murklet:local .
+
+  docker:run:
+    desc: Run the local container image on port 9876 with ./assets mounted read-only
+    cmds:
+      - docker run --rm -p 9876:9876 -v "$PWD/assets:/app/assets:ro" murklet:local
