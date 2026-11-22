@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-11-22
+
+### Added
+
+- **Reproducible pressure and concurrency stress tests (`tests/pressure_stress.rs`, `Taskfile.yml`):** Added an integration stress suite (`task stress`) verifying 64x cache-stampede request coalescing into a single transform, predictable `503 Retry-After` load shedding with zero leaked in-flight gauges under tight pending/memory ceilings, and continuous `POST /cache/purge` under concurrent read load without stale variant resurrection.
+
 ## [0.8.0] - 2026-11-22
 
 ### Added
