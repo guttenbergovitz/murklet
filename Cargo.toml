@@ -1,6 +1,6 @@
 [package]
 name = "murklet"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Image proxy and on-demand image transformation service."
@@ -30,6 +30,10 @@ tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "engine_resize"
+harness = false
+
+[[bench]]
+name = "cache_evict"
 harness = false
 
 [lints.rust]

@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-11-22
+
+### Added
+
+- **Filesystem cache eviction benchmarks (`benches/cache_evict.rs`):** Added reproducible Criterion benchmarks measuring `FsCache::evict` traversal and oldest-`mtime` disk-budget eviction across sharded source-bucketed cache trees (`1,000` and `10,000` entries by default, plus `100,000` via `MURKLET_BENCH_LARGE=1`) to inform future cache indexing decisions with real measurements.
+
 ## [0.7.2] - 2026-11-22
 
 ### Changed

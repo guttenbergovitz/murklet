@@ -31,7 +31,7 @@ tasks:
       - cargo test --locked
 
   bench:
-    desc: Run reproducible Criterion benchmarks for the image engine
+    desc: Run reproducible Criterion benchmarks (image engine and cache eviction)
     cmds:
       - cargo bench --locked
 
