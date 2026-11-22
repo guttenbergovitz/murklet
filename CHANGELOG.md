@@ -4,6 +4,13 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.5] - 2026-11-22
+
+### Fixed
+
+- **Strict `Content-Length` upper-bound enforcement (`src/origin/http.rs`, `src/origin/s3.rs`):** Reject responses whose streamed body exceeds their declared `Content-Length` as an upstream protocol error before requesting any additional `ByteBudget` permits, closing the last edge case where known-length responses could trigger incremental reservation growth.
+- **Slow-origin streaming-gate recovery test (`src/origin/http.rs`):** Added a multi-stream test verifying that a stalling/timing-out chunked upstream releases the streaming gate and byte permits cleanly so concurrent slow chunked streams complete without deadlock.
+
 ## [0.9.4] - 2026-11-22
 
 ### Added
