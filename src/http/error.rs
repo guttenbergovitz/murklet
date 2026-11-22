@@ -102,8 +102,15 @@ impl From<EngineError> for HttpError {
 }
 
 impl From<CacheError> for HttpError {
-    fn from(_err: CacheError) -> Self {
-        Self::Internal
+    fn from(err: CacheError) -> Self {
+        match err {
+            CacheError::BudgetExhausted => Self::ServiceUnavailable {
+                retry_after_secs: 2,
+            },
+            CacheError::InvalidRoot(_) | CacheError::EntryTooLarge { .. } | CacheError::Io(_) => {
+                Self::Internal
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "murklet"
-version = "0.9.1"
+version = "0.9.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Image proxy and on-demand image transformation service."

@@ -497,6 +497,15 @@ mod tests {
             }
         }
 
+        fn write_png(&self, name: &str, width: u32, height: u32, colour: [u8; 4]) {
+            let img = RgbaImage::from_pixel(width, height, Rgba(colour));
+            let mut png = Vec::new();
+            DynamicImage::ImageRgba8(img)
+                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .unwrap();
+            fs::write(self.origin_dir.join(name), png).unwrap();
+        }
+
         fn state(&self) -> AppState {
             let origin = LocalFsOrigin::new(&self.origin_dir, 10 * 1024 * 1024).unwrap();
             let cache = FsCache::new(&self.cache_dir, 10 * 1024 * 1024).unwrap();
@@ -1525,5 +1534,120 @@ mod tests {
                 .render_prometheus()
                 .contains("murklet_in_flight_transforms 0\n")
         );
+    }
+
+    #[tokio::test]
+    async fn singleflight_leader_cancellation_with_concurrent_purge_serves_follower_and_prevents_stale_write()
+     {
+        let fixture = TestFixture::new("singleflight-cancel-purge");
+        fixture.write_png("hero.png", 64, 64, [20, 40, 220, 255]);
+
+        let mut base_state = fixture
+            .state()
+            .with_max_concurrent_fetches(1)
+            .with_max_pending_transforms(4);
+        base_state.cleanup_token = Some("secret".to_owned());
+        let state = Arc::new(base_state);
+        let app = build_router(Arc::clone(&state));
+
+        let send_get = |router: Router| async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri("/load?url=hero.png&w=32&f=jpeg")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let send_purge = |router: Router| async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cache/purge?url=hero.png")
+                        .header("x-cache-cleanup-token", "secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        };
+
+        // Prime and capture v1 ETag, then purge so the variant cache starts empty.
+        let v1_resp = send_get(app.clone()).await;
+        assert_eq!(v1_resp.status(), StatusCode::OK);
+        let v1_etag = v1_resp
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        send_purge(app.clone()).await;
+
+        // Hold the sole fetch permit so the leader blocks deterministically before origin read.
+        let held_fetch = Arc::clone(&state.fetch_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let leader = tokio::spawn(send_get(app.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.pending_transform_permits.available_permits() != 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("leader never acquired pending permit");
+
+        // Spawn a follower on the same variant key and verify it coalesces onto the leader.
+        let follower = tokio::spawn(send_get(app.clone()));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(state.pending_transform_permits.available_permits(), 3);
+
+        // Abort the leader; the follower must take over leadership and block on fetch.
+        leader.abort();
+        let _ = leader.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.pending_transform_permits.available_permits() != 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("follower did not take over leadership after leader abort");
+
+        // Mutate the source to v2 and purge while the follower holds a pre-purge FlightToken.
+        fixture.write_png("hero.png", 64, 64, [230, 30, 30, 255]);
+        send_purge(app.clone()).await;
+        drop(held_fetch);
+
+        let follower_resp = follower.await.unwrap();
+        assert_eq!(follower_resp.status(), StatusCode::OK);
+        let follower_etag = follower_resp
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(follower_etag, v1_etag);
+
+        // Pre-purge follower must skip disk persistence; next request must MISS with fresh v2.
+        let post_purge = send_get(app.clone()).await;
+        assert_eq!(post_purge.status(), StatusCode::OK);
+        assert_eq!(post_purge.headers().get("x-cache").unwrap(), "MISS");
+        assert_eq!(
+            post_purge.headers().get(ETAG).unwrap().to_str().unwrap(),
+            follower_etag
+        );
+
+        assert_eq!(state.pending_transform_permits.available_permits(), 4);
+        assert_eq!(state.fetch_permits.available_permits(), 1);
+        let metrics = state.metrics.render_prometheus();
+        assert!(metrics.contains("murklet_in_flight_transforms 0\n"));
+        assert!(metrics.contains("murklet_in_flight_fetches 0\n"));
+        assert!(metrics.contains("murklet_in_flight_source_bytes 0\n"));
     }
 }

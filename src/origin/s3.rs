@@ -244,15 +244,19 @@ impl S3Origin {
             });
         }
 
-        let initial_cap = response
+        let content_length = response
             .content_length()
-            .and_then(|len| usize::try_from(len).ok())
-            .unwrap_or(0)
-            .min(self.max_bytes);
-        if initial_cap > 0
-            && let Some(res) = reservation.as_deref_mut()
-        {
-            res.reserve_total(initial_cap).await?;
+            .and_then(|len| usize::try_from(len).ok());
+        let initial_cap = content_length.unwrap_or(0).min(self.max_bytes);
+        let mut streaming_gate = None;
+        if let Some(res) = reservation.as_deref_mut() {
+            if content_length.is_some() {
+                if initial_cap > 0 {
+                    res.reserve_total(initial_cap).await?;
+                }
+            } else {
+                streaming_gate = res.reserve_unknown_length_headroom(self.max_bytes).await?;
+            }
         }
         let mut bytes = Vec::with_capacity(initial_cap);
 
@@ -274,6 +278,11 @@ impl S3Origin {
                 res.reserve_total(new_len).await?;
             }
             bytes.extend_from_slice(&chunk);
+        }
+
+        drop(streaming_gate);
+        if let Some(res) = reservation {
+            res.shrink_to(bytes.len());
         }
 
         Ok(FetchedImage { bytes })

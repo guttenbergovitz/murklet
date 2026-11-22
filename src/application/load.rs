@@ -682,18 +682,8 @@ async fn fetch_source_bytes(
 
     let digest = source_digest_hex(origin_id, source);
 
-    if let Some(cached) = lookup_source_cache(state, &digest).await {
-        let mut reservation = state
-            .source_byte_budget
-            .begin(state.transform_queue_timeout);
-        reservation
-            .reserve_total(cached.len())
-            .await
-            .map_err(|err| map_origin_fetch_error(state, err))?;
-        return Ok(Arc::new(ReservedSource {
-            bytes: cached,
-            _reservation: reservation,
-        }));
+    if let Some(cached) = lookup_source_cache(state, &digest).await? {
+        return Ok(cached);
     }
 
     let coalesced = state
@@ -765,12 +755,35 @@ async fn acquire_fetch_permit(
     .map_err(|_| HttpError::Internal)
 }
 
-async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
-    let source_cache = state.source_cache.clone()?;
+async fn lookup_source_cache(
+    state: &AppState,
+    digest: &str,
+) -> Result<Option<Arc<ReservedSource>>, HttpError> {
+    let Some(source_cache) = state.source_cache.clone() else {
+        return Ok(None);
+    };
     let digest_for_get = digest.to_owned();
-    match tokio::task::spawn_blocking(move || source_cache.get_raw(&digest_for_get)).await {
-        Ok(Ok(Some(cached))) => Some(Bytes::from(cached)),
-        Ok(Ok(None)) => None,
+    let mut reservation = state
+        .source_byte_budget
+        .begin(state.transform_queue_timeout);
+    match tokio::task::spawn_blocking(move || {
+        let maybe_bytes = source_cache.get_raw_with_budget(&digest_for_get, |total_bytes| {
+            reservation
+                .reserve_total_blocking(total_bytes)
+                .map_err(|_| crate::cache::CacheError::BudgetExhausted)
+        })?;
+        Ok::<_, crate::cache::CacheError>(maybe_bytes.map(|bytes| (bytes, reservation)))
+    })
+    .await
+    {
+        Ok(Ok(Some((cached, reservation)))) => Ok(Some(Arc::new(ReservedSource {
+            bytes: Bytes::from(cached),
+            _reservation: reservation,
+        }))),
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(crate::cache::CacheError::BudgetExhausted)) => {
+            Err(reject_backpressure(state, BackpressureReason::ByteBudget))
+        }
         Ok(Err(err)) => {
             state
                 .metrics
@@ -781,7 +794,7 @@ async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
                 error = %err,
                 "source cache read failed; falling back to origin"
             );
-            None
+            Ok(None)
         }
         Err(err) => {
             state
@@ -793,7 +806,7 @@ async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
                 error = %err,
                 "source cache read task failed; falling back to origin"
             );
-            None
+            Ok(None)
         }
     }
 }

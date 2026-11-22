@@ -208,4 +208,65 @@ mod tests {
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
     }
+
+    #[tokio::test]
+    async fn leader_cancellation_hands_over_to_follower_cleanly() {
+        use tokio::sync::Notify;
+
+        let coalescer: Coalescer<&'static str, usize> = Coalescer::new();
+        let leader_entered = Arc::new(Notify::new());
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        let leader = {
+            let coalescer = coalescer.clone();
+            let leader_entered = Arc::clone(&leader_entered);
+            let executions = Arc::clone(&executions);
+            tokio::spawn(async move {
+                coalescer
+                    .execute("shared-key", || {
+                        let leader_entered = Arc::clone(&leader_entered);
+                        let executions = Arc::clone(&executions);
+                        async move {
+                            executions.fetch_add(1, Ordering::SeqCst);
+                            leader_entered.notify_one();
+                            // Hang indefinitely until aborted.
+                            std::future::pending::<usize>().await
+                        }
+                    })
+                    .await
+            })
+        };
+
+        leader_entered.notified().await;
+
+        let follower = {
+            let coalescer = coalescer.clone();
+            let executions = Arc::clone(&executions);
+            tokio::spawn(async move {
+                coalescer
+                    .execute("shared-key", || {
+                        let executions = Arc::clone(&executions);
+                        async move { executions.fetch_add(1, Ordering::SeqCst) + 1 }
+                    })
+                    .await
+            })
+        };
+
+        // Yield so the follower subscribes to the leader's channel before aborting the leader.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        leader.abort();
+        let _ = leader.await;
+
+        let outcome = follower.await.unwrap();
+        assert!(!outcome.was_coalesced);
+        assert_eq!(outcome.value, 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert!(
+            coalescer
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
 }
