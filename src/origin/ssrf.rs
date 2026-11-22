@@ -103,6 +103,14 @@ pub fn validate_remote_url(
     allowlist: &HostAllowlist,
     enforce_ip_block: bool,
 ) -> Result<Url, OriginError> {
+    // Reject backslashes and ASCII control characters before WHATWG normalisation
+    // to prevent URL-parser differential bypasses (e.g. `host\@127.0.0.1`).
+    if raw_url.contains('\\') || raw_url.bytes().any(|b| b.is_ascii_control()) {
+        return Err(OriginError::InvalidPath(
+            "remote URL contains disallowed backslash or control characters".to_owned(),
+        ));
+    }
+
     let parsed = Url::parse(raw_url)
         .map_err(|_| OriginError::InvalidPath("invalid remote URL".to_owned()))?;
 
