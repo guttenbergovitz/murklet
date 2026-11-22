@@ -182,6 +182,9 @@ async fn serve(config: MurkletConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let mut state = AppState::from_parts(local_origin, http_origin, cache)
         .with_max_concurrent_transforms(config.limits.max_concurrent_transforms)
+        .with_max_concurrent_fetches(config.limits.max_concurrent_fetches)
+        .with_max_pending_transforms(config.limits.max_pending_transforms)
+        .with_max_in_flight_source_bytes(config.limits.max_in_flight_source_bytes)
         .with_origin_policies(origin_policies);
     if let Some(s3) = s3_origin {
         state = state.with_s3_origin(s3);

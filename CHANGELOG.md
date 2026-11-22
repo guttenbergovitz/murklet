@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-11-22
+
+### Added
+
+- **Bounded fetch concurrency, pending queue, and in-flight source memory budget (`src/policy/config.rs`, `src/http/router.rs`, `src/main.rs`):** Added `limits.max_concurrent_fetches` (default `32`), `limits.max_pending_transforms` (default `64`, shedding excess cache-miss load with `503 Retry-After` before touching any origin), and `limits.max_in_flight_source_bytes` (default `256 MiB`, bounding aggregate raw source bytes held in memory while waiting for or executing image transformations).
+
 ## [0.6.1] - 2026-11-22
 
 ### Fixed

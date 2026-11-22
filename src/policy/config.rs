@@ -27,6 +27,15 @@ pub const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 /// Default upper bound on concurrent CPU-bound image transformations.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFORMS: usize = 8;
 
+/// Default upper bound on concurrent origin fetches (local, HTTP(S), or S3).
+pub const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 32;
+
+/// Default upper bound on total in-flight cache-miss requests (active plus queued).
+pub const DEFAULT_MAX_PENDING_TRANSFORMS: usize = 64;
+
+/// Default aggregate raw source byte budget held in memory across in-flight requests (256 MiB).
+pub const DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Default maximum time a request waits for a transform slot before returning `503`.
 pub const DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS: u64 = 10;
 
@@ -198,6 +207,16 @@ pub struct LimitsConfig {
     /// Maximum number of concurrent CPU-bound image transformations (backpressure guard).
     #[serde(default = "default_max_concurrent_transforms")]
     pub max_concurrent_transforms: usize,
+    /// Maximum number of concurrent origin fetches across local, HTTP(S), and S3 adapters.
+    #[serde(default = "default_max_concurrent_fetches")]
+    pub max_concurrent_fetches: usize,
+    /// Maximum number of in-flight cache-miss requests (active plus queued for transformation).
+    /// Excess requests fail fast with `503 Retry-After` before fetching from origin.
+    #[serde(default = "default_max_pending_transforms")]
+    pub max_pending_transforms: usize,
+    /// Aggregate raw source bytes allowed in memory across all in-flight cache-miss requests.
+    #[serde(default = "default_max_in_flight_source_bytes")]
+    pub max_in_flight_source_bytes: usize,
     /// Maximum seconds a request waits for a transform slot before returning `503 Retry-After`.
     #[serde(default = "default_transform_queue_timeout_secs")]
     pub transform_queue_timeout_secs: u64,
@@ -214,6 +233,9 @@ impl Default for LimitsConfig {
             max_target_dimension: default_max_target_dimension(),
             max_decoded_pixels: default_max_decoded_pixels(),
             max_concurrent_transforms: default_max_concurrent_transforms(),
+            max_concurrent_fetches: default_max_concurrent_fetches(),
+            max_pending_transforms: default_max_pending_transforms(),
+            max_in_flight_source_bytes: default_max_in_flight_source_bytes(),
             transform_queue_timeout_secs: DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS,
             animation_policy: AnimationPolicyConfig::FirstFrame,
         }
@@ -628,6 +650,14 @@ impl MurkletConfig {
             }
         }
 
+        self.validate_limits()?;
+        self.validate_origins()?;
+        self.validate_watermarks_and_presets()?;
+
+        Ok(())
+    }
+
+    fn validate_limits(&self) -> Result<(), PolicyError> {
         if self.limits.max_input_bytes == 0 {
             return Err(PolicyError::Validation(
                 "limits.max_input_bytes must be greater than zero".to_owned(),
@@ -653,15 +683,28 @@ impl MurkletConfig {
                 "limits.max_concurrent_transforms must be greater than zero".to_owned(),
             ));
         }
+        if self.limits.max_concurrent_fetches == 0 {
+            return Err(PolicyError::Validation(
+                "limits.max_concurrent_fetches must be greater than zero".to_owned(),
+            ));
+        }
+        if self.limits.max_pending_transforms < self.limits.max_concurrent_transforms {
+            return Err(PolicyError::Validation(
+                "limits.max_pending_transforms must be at least limits.max_concurrent_transforms"
+                    .to_owned(),
+            ));
+        }
+        if self.limits.max_in_flight_source_bytes < self.limits.max_input_bytes {
+            return Err(PolicyError::Validation(
+                "limits.max_in_flight_source_bytes must be at least limits.max_input_bytes"
+                    .to_owned(),
+            ));
+        }
         if self.limits.transform_queue_timeout_secs == 0 {
             return Err(PolicyError::Validation(
                 "limits.transform_queue_timeout_secs must be greater than zero".to_owned(),
             ));
         }
-
-        self.validate_origins()?;
-        self.validate_watermarks_and_presets()?;
-
         Ok(())
     }
 
@@ -816,6 +859,18 @@ const fn default_max_decoded_pixels() -> u64 {
 
 const fn default_max_concurrent_transforms() -> usize {
     DEFAULT_MAX_CONCURRENT_TRANSFORMS
+}
+
+const fn default_max_concurrent_fetches() -> usize {
+    DEFAULT_MAX_CONCURRENT_FETCHES
+}
+
+const fn default_max_pending_transforms() -> usize {
+    DEFAULT_MAX_PENDING_TRANSFORMS
+}
+
+const fn default_max_in_flight_source_bytes() -> usize {
+    DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES
 }
 
 const fn default_transform_queue_timeout_secs() -> u64 {
@@ -1097,6 +1152,29 @@ default_watermark = "missing"
 "#;
         assert!(matches!(
             MurkletConfig::from_toml_str(bad_wm),
+            Err(PolicyError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn validates_fetch_pending_and_in_flight_byte_limit_invariants() {
+        let zero_fetches = "[limits]\nmax_concurrent_fetches = 0\n";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(zero_fetches),
+            Err(PolicyError::Validation(_))
+        ));
+
+        let pending_below_concurrent =
+            "[limits]\nmax_concurrent_transforms = 8\nmax_pending_transforms = 4\n";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(pending_below_concurrent),
+            Err(PolicyError::Validation(_))
+        ));
+
+        let byte_budget_below_input =
+            "[limits]\nmax_input_bytes = 2048\nmax_in_flight_source_bytes = 1024\n";
+        assert!(matches!(
+            MurkletConfig::from_toml_str(byte_budget_below_input),
             Err(PolicyError::Validation(_))
         ));
     }

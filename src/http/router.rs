@@ -30,13 +30,21 @@ use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
 use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
 use crate::policy::{
-    DEFAULT_MAX_CONCURRENT_TRANSFORMS, DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, OriginPolicies,
-    OriginPolicy, PresetRegistry, RequestSigner,
+    DEFAULT_MAX_CONCURRENT_FETCHES, DEFAULT_MAX_CONCURRENT_TRANSFORMS,
+    DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES, DEFAULT_MAX_PENDING_TRANSFORMS,
+    DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, OriginPolicies, OriginPolicy, PresetRegistry,
+    RequestSigner,
 };
 
 const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
 const S3_ORIGIN_ID: &str = "s3";
+
+/// Converts a byte count into 1 KiB semaphore permit units (rounded up, minimum 1).
+fn bytes_to_kib_permits(bytes: usize) -> u32 {
+    let kib = bytes.div_ceil(1024).max(1);
+    u32::try_from(kib.min(Semaphore::MAX_PERMITS)).unwrap_or(u32::MAX)
+}
 
 /// Shared output of a cache-miss fetch and transformation, holding refcounted
 /// [`Bytes`] so coalesced followers share encoded payloads without copying.
@@ -95,6 +103,10 @@ pub struct AppState {
     coalescer: VariantCoalescer,
     source_coalescer: SourceCoalescer,
     transform_permits: Arc<Semaphore>,
+    fetch_permits: Arc<Semaphore>,
+    pending_transform_permits: Arc<Semaphore>,
+    in_flight_byte_permits: Arc<Semaphore>,
+    in_flight_source_budget_kib: u32,
     metrics: Arc<Metrics>,
 }
 
@@ -127,6 +139,12 @@ impl AppState {
             coalescer: Coalescer::new(),
             source_coalescer: Coalescer::new(),
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
+            fetch_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FETCHES)),
+            pending_transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_TRANSFORMS)),
+            in_flight_byte_permits: Arc::new(Semaphore::new(bytes_to_kib_permits(
+                DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES,
+            ) as usize)),
+            in_flight_source_budget_kib: bytes_to_kib_permits(DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES),
             metrics: Arc::new(Metrics::new()),
         }
     }
@@ -163,6 +181,29 @@ impl AppState {
     #[must_use]
     pub fn with_max_concurrent_transforms(mut self, max_concurrent: usize) -> Self {
         self.transform_permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
+        self
+    }
+
+    /// Sets the maximum number of concurrent origin fetches across all origin adapters.
+    #[must_use]
+    pub fn with_max_concurrent_fetches(mut self, max_fetches: usize) -> Self {
+        self.fetch_permits = Arc::new(Semaphore::new(max_fetches.max(1)));
+        self
+    }
+
+    /// Sets the maximum total in-flight cache-miss requests (active plus queued).
+    #[must_use]
+    pub fn with_max_pending_transforms(mut self, max_pending: usize) -> Self {
+        self.pending_transform_permits = Arc::new(Semaphore::new(max_pending.max(1)));
+        self
+    }
+
+    /// Sets the aggregate raw source byte budget held in memory across in-flight requests.
+    #[must_use]
+    pub fn with_max_in_flight_source_bytes(mut self, max_bytes: usize) -> Self {
+        let budget_kib = bytes_to_kib_permits(max_bytes);
+        self.in_flight_byte_permits = Arc::new(Semaphore::new(budget_kib as usize));
+        self.in_flight_source_budget_kib = budget_kib;
         self
     }
 
@@ -552,8 +593,34 @@ async fn fetch_transform_and_cache(
     key: CacheKey,
 ) -> Result<Arc<MissOutcome>, HttpError> {
     let started = Instant::now();
+
+    // Shed excess cache-miss load immediately before touching any origin so the
+    // queue waiting for CPU transform slots stays strictly bounded.
+    let _pending_permit = Arc::clone(&state.pending_transform_permits)
+        .try_acquire_owned()
+        .map_err(|_| HttpError::ServiceUnavailable {
+            retry_after_secs: 2,
+        })?;
+
     let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source).await?;
     let original_size = source_bytes.len();
+
+    // Account for raw source bytes held in memory until transformation drops them.
+    let source_kib = bytes_to_kib_permits(original_size);
+    if source_kib > state.in_flight_source_budget_kib {
+        return Err(HttpError::ServiceUnavailable {
+            retry_after_secs: 2,
+        });
+    }
+    let _byte_permit = tokio::time::timeout(
+        state.transform_queue_timeout,
+        Arc::clone(&state.in_flight_byte_permits).acquire_many_owned(source_kib),
+    )
+    .await
+    .map_err(|_| HttpError::ServiceUnavailable {
+        retry_after_secs: 2,
+    })?
+    .map_err(|_| HttpError::Internal)?;
 
     // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
     // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
@@ -630,6 +697,7 @@ async fn fetch_source_bytes(
     source: &str,
 ) -> Result<Bytes, HttpError> {
     if origin_kind == OriginKind::Local {
+        let _fetch_permit = acquire_fetch_permit(state).await?;
         let local_origin = state.local_origin.clone().ok_or_else(|| {
             HttpError::Forbidden("local filesystem origin is disabled".to_owned())
         })?;
@@ -653,6 +721,7 @@ async fn fetch_source_bytes(
             let source_owned = source.to_owned();
             let digest_for_put = digest.clone();
             async move {
+                let fetch_permit = acquire_fetch_permit(&state).await?;
                 let fetched = match origin_kind {
                     OriginKind::Http => {
                         let http_origin = state.http_origin.as_ref().ok_or_else(|| {
@@ -668,6 +737,7 @@ async fn fetch_source_bytes(
                     }
                     OriginKind::Local => return Err(HttpError::Internal),
                 };
+                drop(fetch_permit);
 
                 let bytes = Bytes::from(fetched.bytes);
                 store_source_cache(&state, digest_for_put, bytes.clone()).await;
@@ -677,6 +747,20 @@ async fn fetch_source_bytes(
         .await;
 
     coalesced.value
+}
+
+async fn acquire_fetch_permit(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, HttpError> {
+    tokio::time::timeout(
+        state.transform_queue_timeout,
+        Arc::clone(&state.fetch_permits).acquire_owned(),
+    )
+    .await
+    .map_err(|_| HttpError::ServiceUnavailable {
+        retry_after_secs: 2,
+    })?
+    .map_err(|_| HttpError::Internal)
 }
 
 async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
@@ -1853,5 +1937,72 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"read\"} 1\n"));
         assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"write\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn saturated_pending_fetch_and_byte_limits_return_503_with_retry_after() {
+        let fixture = TestFixture::new("resource-isolation");
+
+        // 1. Saturated pending queue fails fast before fetching.
+        let mut pending_state = fixture.state().with_max_pending_transforms(1);
+        pending_state.transform_queue_timeout = Duration::from_secs(5);
+        let pending_state = Arc::new(pending_state);
+        let held_pending = Arc::clone(&pending_state.pending_transform_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let pending_resp = build_router(pending_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pending_resp.headers().get("retry-after").unwrap(), "2");
+        drop(held_pending);
+
+        // 2. Saturated fetch permits time out with 503 Retry-After.
+        let mut fetch_state = fixture.state().with_max_concurrent_fetches(1);
+        fetch_state.transform_queue_timeout = Duration::from_millis(30);
+        let fetch_state = Arc::new(fetch_state);
+        let held_fetch = Arc::clone(&fetch_state.fetch_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let fetch_resp = build_router(fetch_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fetch_resp.headers().get("retry-after").unwrap(), "2");
+        drop(held_fetch);
+
+        // 3. Saturated in-flight source byte budget times out with 503 Retry-After.
+        let mut byte_state = fixture.state().with_max_in_flight_source_bytes(1024);
+        byte_state.transform_queue_timeout = Duration::from_millis(30);
+        let byte_state = Arc::new(byte_state);
+        let _held_bytes = Arc::clone(&byte_state.in_flight_byte_permits)
+            .acquire_many_owned(1)
+            .await
+            .unwrap();
+        let byte_resp = build_router(byte_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(byte_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(byte_resp.headers().get("retry-after").unwrap(), "2");
     }
 }
