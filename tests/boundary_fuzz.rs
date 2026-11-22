@@ -134,7 +134,7 @@ fn fuzz_query_parser_never_panics_on_adversarial_and_mutated_inputs() {
 
         if let Ok(parsed) = parse_load_query(raw, DEFAULT_MAX_DIMENSION) {
             // Every accepted query must yield a non-empty source and valid canonical cache key.
-            assert!(!parsed.source.is_empty());
+            assert_ne!(parsed.source, "");
             let key = CacheKey::from_parts("local", &parsed.source, &parsed.spec);
             assert_eq!(key.digest_hex().len(), 64);
         }

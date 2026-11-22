@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(not_modified.headers().get("x-cache").unwrap(), "HIT");
         let empty = not_modified.into_body().collect().await.unwrap().to_bytes();
-        assert!(empty.is_empty());
+        assert_eq!(empty.as_ref(), b"");
     }
 
     #[tokio::test]
