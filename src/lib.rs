@@ -7,9 +7,11 @@
 //! - [`policy`] — declarative allowlists, transformation rules, and resource limits.
 //! - [`origin`] — source adapters (HTTP(S), local filesystem, S3-compatible storage).
 //! - [`engine`] — image decoding, transformation, and encoding behind a narrow boundary.
-//! - [`cache`] — variant storage, canonical key indexing, and request coalescing.
+//! - [`cache`] — variant storage, canonical key indexing, invalidation epochs, and request coalescing.
+//! - [`application`] — load, fetch, transform, cache, and invalidation orchestration.
 //! - [`http`] — transport layer: request parsing, response headers, and status mapping.
 
+pub mod application;
 pub mod cache;
 pub mod domain;
 pub mod engine;
