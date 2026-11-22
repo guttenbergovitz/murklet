@@ -580,7 +580,7 @@ fn apply_vignette(image: DynamicImage, strength: u8) -> DynamicImage {
         let dx = ((x as f32 + 0.5) - cx) / cx;
         let dy = ((y as f32 + 0.5) - cy) / cy;
         // Normalised radial distance squared (0 at centre, ~2 at corners).
-        let d2 = (dx * dx + dy * dy) * 0.5;
+        let d2 = f32::midpoint(dx * dx, dy * dy);
         let factor = (1.0 - intensity * d2).clamp(0.0, 1.0);
         px.0[0] = clamp_f32_to_u8(f32::from(px.0[0]) * factor);
         px.0[1] = clamp_f32_to_u8(f32::from(px.0[1]) * factor);
@@ -1055,7 +1055,7 @@ mod tests {
             ..TransformSpec::default()
         };
         let combo = transform(&solid_png, &combo_spec, &EngineLimits::default()).unwrap();
-        assert!(!combo.bytes.is_empty());
+        assert_ne!(combo.bytes.len(), 0);
     }
 
     #[test]
@@ -1124,6 +1124,6 @@ mod tests {
             ..TransformSpec::default()
         };
         let out = transform(&img, &creative_spec, &EngineLimits::default()).unwrap();
-        assert!(!out.bytes.is_empty());
+        assert_ne!(out.bytes.len(), 0);
     }
 }

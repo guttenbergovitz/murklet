@@ -157,9 +157,10 @@ fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
     }
 
     let mut out = [0_u8; 32];
-    for (slot, pair) in out.iter_mut().zip(raw.chunks_exact(2)) {
-        let hi = hex_nibble(pair[0])?;
-        let lo = hex_nibble(pair[1])?;
+    let (pairs, _) = raw.as_chunks::<2>();
+    for (slot, &[hi_byte, lo_byte]) in out.iter_mut().zip(pairs) {
+        let hi = hex_nibble(hi_byte)?;
+        let lo = hex_nibble(lo_byte)?;
         *slot = (hi << 4) | lo;
     }
     Some(out)
