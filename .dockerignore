@@ -1,7 +1,17 @@
 /target/
 /cache/
 /.cache/
+/assets/
+/murklet.toml
 /.git/
+/.github/
 /.specs/
+/.agents/
+/docs/
+/scripts/
+/tests/
+/benches/
 .DS_Store
 *.swp
+*.pyc
+__pycache__/

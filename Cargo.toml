@@ -4,6 +4,9 @@ version = "0.9.6"
 edition = "2024"
 rust-version = "1.88"
 description = "Image proxy and on-demand image transformation service."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/guttenbergovitz/murklet"
+readme = "README.md"
 publish = false
 
 [dependencies]
