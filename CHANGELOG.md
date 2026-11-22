@@ -4,6 +4,30 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] - 2026-11-22
+
+### Added
+
+- **Architecture decision record (`docs/adr/0004-resource-isolation-and-invalidation-semantics.md`):** Documented the four-stage backpressure model (`max_pending_transforms`, `max_concurrent_fetches`, `max_in_flight_source_bytes`, `max_concurrent_transforms`), linearisable in-memory invalidation epochs (`InvalidationTracker`) including their single-instance scope, and cache-error observability guarantees.
+
+## [0.8.2] - 2026-11-22
+
+### Added
+
+- **Deterministic boundary fuzz tests (`tests/boundary_fuzz.rs`):** Added reproducible adversarial and mutated-input test suites covering HTTP query parsing, `Accept` header negotiation, SSRF URL/IP bypass attempts, truncated PNG/JPEG streams, random payloads, and crafted 65535×65535 PNG/GIF decompression-bomb headers.
+
+## [0.8.1] - 2026-11-22
+
+### Added
+
+- **Reproducible pressure and concurrency stress tests (`tests/pressure_stress.rs`, `Taskfile.yml`):** Added an integration stress suite (`task stress`) verifying 64x cache-stampede request coalescing into a single transform, predictable `503 Retry-After` load shedding with zero leaked in-flight gauges under tight pending/memory ceilings, and continuous `POST /cache/purge` under concurrent read load without stale variant resurrection.
+
+## [0.8.0] - 2026-11-22
+
+### Added
+
+- **Backpressure rejection counters and in-flight resource gauges (`src/http/metrics.rs`, `src/application/load.rs`):** Exposed `murklet_backpressure_rejections_total{reason="pending_queue|fetch_timeout|byte_budget|transform_timeout"}` alongside RAII-tracked `murklet_in_flight_fetches` and `murklet_in_flight_source_bytes` gauges on `GET /metrics` so operators can distinguish which resource limit triggered `503 Service Unavailable`.
+
 ## [0.7.3] - 2026-11-22
 
 ### Added

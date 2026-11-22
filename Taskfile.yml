@@ -30,6 +30,11 @@ tasks:
     cmds:
       - cargo test --locked
 
+  stress:
+    desc: Run pressure and concurrency stress tests (stampede, backpressure, purge under load)
+    cmds:
+      - cargo test --test pressure_stress --locked -- --nocapture
+
   bench:
     desc: Run reproducible Criterion benchmarks (image engine and cache eviction)
     cmds:
