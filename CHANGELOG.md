@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.3] - 2026-11-22
+
+### Fixed
+
+- **Deadlock-free unknown-length streaming byte budget (`src/origin/budget.rs`, `src/origin/http.rs`, `src/origin/s3.rs`):** Added `ByteReservation::reserve_unknown_length_headroom` and `ByteReservation::shrink_to`. Chunked/unknown-length responses now reserve `max_bytes` atomically upfront and shrink to actual length on completion when `max_bytes` fits within the budget, or serialise incremental growth behind a single streaming gate when the budget is tighter than `max_bytes`, preventing concurrent partial holders from deadlocking until timeout.
+
 ## [0.9.2] - 2026-11-22
 
 ### Fixed
