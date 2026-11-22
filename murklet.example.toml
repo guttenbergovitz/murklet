@@ -38,6 +38,12 @@ max_source_dimension = 16384
 max_target_dimension = 8192
 max_decoded_pixels = 64000000
 max_concurrent_transforms = 8
+# Maximum concurrent origin fetches (local, HTTP(S), and S3).
+max_concurrent_fetches = 32
+# Maximum total in-flight cache-miss requests (active + queued); excess fail fast with 503.
+max_pending_transforms = 64
+# Aggregate raw source byte budget held in memory across in-flight requests (256 MiB).
+max_in_flight_source_bytes = 268435456
 # Maximum time a request waits for a transform slot before returning 503 Retry-After.
 transform_queue_timeout_secs = 10
 # Fallback for multi-frame GIF/WebP inputs: "first_frame" or "passthrough"

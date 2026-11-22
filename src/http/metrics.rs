@@ -138,6 +138,60 @@ impl OriginKind {
     }
 }
 
+/// Cache storage tier label for `murklet_cache_errors_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTier {
+    /// Encoded variant cache (`[cache]`).
+    Variant,
+    /// Raw upstream source cache (`[cache.source]`).
+    Source,
+}
+
+impl CacheTier {
+    const ALL: [Self; 2] = [Self::Variant, Self::Source];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Variant => 0,
+            Self::Source => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Variant => "variant",
+            Self::Source => "source",
+        }
+    }
+}
+
+/// Cache operation label for `murklet_cache_errors_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOp {
+    /// Cache read (`get` / `get_raw`).
+    Read,
+    /// Cache write (`put` / `put_raw`).
+    Write,
+}
+
+impl CacheOp {
+    const ALL: [Self; 2] = [Self::Read, Self::Write];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
 const ALL_FORMATS: [OutputFormat; 5] = [
     OutputFormat::Jpeg,
     OutputFormat::Png,
@@ -166,6 +220,7 @@ pub struct Metrics {
     transform_count: AtomicU64,
     transform_sum_micros: AtomicU64,
     cache_cleanups: AtomicU64,
+    cache_errors: [[AtomicU64; 2]; 2],
 }
 
 /// RAII guard tracking an active image transformation in [`Metrics::in_flight_transforms`].
@@ -223,6 +278,11 @@ impl Metrics {
     /// Increments `murklet_cache_cleanups_total`.
     pub fn record_cache_cleanup(&self) {
         self.cache_cleanups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments `murklet_cache_errors_total` for the given cache tier and operation.
+    pub fn record_cache_error(&self, tier: CacheTier, op: CacheOp) {
+        self.cache_errors[tier.index()][op.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Renders all metrics in Prometheus text exposition format (`v0.0.4`).
@@ -301,6 +361,22 @@ impl Metrics {
         out.push_str("# TYPE murklet_cache_cleanups_total counter\n");
         let _ = writeln!(out, "murklet_cache_cleanups_total {cleanups}");
 
+        out.push_str("# HELP murklet_cache_errors_total Total filesystem cache read and write errors by tier and operation.\n");
+        out.push_str("# TYPE murklet_cache_errors_total counter\n");
+        for tier in CacheTier::ALL {
+            for op in CacheOp::ALL {
+                let count = self.cache_errors[tier.index()][op.index()].load(Ordering::Relaxed);
+                if count > 0 {
+                    let _ = writeln!(
+                        out,
+                        "murklet_cache_errors_total{{cache=\"{}\",op=\"{}\"}} {count}",
+                        tier.as_str(),
+                        op.as_str()
+                    );
+                }
+            }
+        }
+
         out
     }
 }
@@ -321,6 +397,8 @@ mod tests {
             Duration::from_millis(42),
         );
         metrics.record_cache_cleanup();
+        metrics.record_cache_error(CacheTier::Variant, CacheOp::Read);
+        metrics.record_cache_error(CacheTier::Source, CacheOp::Write);
 
         let guard = metrics.track_in_flight();
         let during = metrics.render_prometheus();
@@ -337,5 +415,7 @@ mod tests {
         assert!(after.contains("murklet_transform_duration_seconds_sum 0.042000\n"));
         assert!(after.contains("murklet_transform_duration_seconds_count 1\n"));
         assert!(after.contains("murklet_cache_cleanups_total 1\n"));
+        assert!(after.contains("murklet_cache_errors_total{cache=\"variant\",op=\"read\"} 1\n"));
+        assert!(after.contains("murklet_cache_errors_total{cache=\"source\",op=\"write\"} 1\n"));
     }
 }

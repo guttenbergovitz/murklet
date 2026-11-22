@@ -11,7 +11,9 @@ pub mod router;
 
 pub use error::HttpError;
 pub use explain::{ExplainReport, explain_load_request};
-pub use metrics::{CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass};
+pub use metrics::{
+    CacheOp, CacheOutcome, CacheTier, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
+};
 pub use negotiate::negotiate_format;
 pub use policy_test::{
     ExpectedDecision, PolicyCaseOutcome, PolicySuiteReport, PolicyTestCase, PolicyTestSuite,

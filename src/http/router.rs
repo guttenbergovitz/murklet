@@ -1,7 +1,12 @@
-//! Axum router and HTTP handlers wiring domain, origins, engine, and cache layers.
+//! Axum HTTP transport layer: routing, authentication checks, conditional
+//! responses (`ETag` / `If-None-Match`), diagnostic headers, and status mapping.
+//!
+//! Business orchestration (policy resolution, cache lookup, request coalescing,
+//! resource isolation, origin fetching, transformation, and invalidation) lives
+//! in [`crate::application::load`].
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -14,174 +19,17 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
-use tokio::sync::Semaphore;
 
-use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag, source_digest_hex};
-use crate::domain::{
-    DEFAULT_MAX_DIMENSION, ImageDimensions, OutputFormat, SelectedFilter, TransformSpec,
+pub use crate::application::AppState;
+use crate::application::{
+    LoadExecution, MissOutcome, cleanup_all_caches, execute_load, purge_source_entries,
+    resolve_and_validate_load,
 };
-use crate::engine::{self, EngineLimits, WatermarkRegistry};
+use crate::domain::OutputFormat;
 use crate::http::error::HttpError;
-use crate::http::metrics::{
-    CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
-};
-use crate::http::negotiate::negotiate_format_allowed;
-use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
-use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
+use crate::http::metrics::{CacheOutcome, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass};
+use crate::http::query::RawLoadQuery;
 pub use crate::policy::DEFAULT_CACHE_CONTROL;
-use crate::policy::{
-    DEFAULT_MAX_CONCURRENT_TRANSFORMS, DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS, OriginPolicies,
-    OriginPolicy, PresetRegistry, RequestSigner,
-};
-
-const LOCAL_ORIGIN_ID: &str = "local";
-const HTTP_ORIGIN_ID: &str = "http";
-const S3_ORIGIN_ID: &str = "s3";
-
-/// Shared output of a cache-miss fetch and transformation, holding refcounted
-/// [`Bytes`] so coalesced followers share encoded payloads without copying.
-#[derive(Debug)]
-struct MissOutcome {
-    bytes: Bytes,
-    format: OutputFormat,
-    source_dimensions: ImageDimensions,
-    output_dimensions: ImageDimensions,
-    filter: SelectedFilter,
-    original_size: usize,
-    etag: String,
-}
-
-type VariantCoalescer = Coalescer<CacheKey, Result<Arc<MissOutcome>, HttpError>>;
-type SourceCoalescer = Coalescer<String, Result<Bytes, HttpError>>;
-
-/// Shared immutable application state injected into HTTP handlers.
-#[derive(Debug, Clone)]
-pub struct AppState {
-    /// Optional local filesystem origin adapter.
-    pub local_origin: Option<LocalFsOrigin>,
-    /// Optional HTTP(S) origin adapter (disabled by default unless configured with an allowlist).
-    pub http_origin: Option<HttpOrigin>,
-    /// Optional S3-compatible object storage origin adapter.
-    pub s3_origin: Option<S3Origin>,
-    /// Filesystem-backed variant cache.
-    pub cache: FsCache,
-    /// Optional filesystem-backed raw-source cache for remote HTTP(S) and S3 origins.
-    pub source_cache: Option<FsCache>,
-    /// Resource limits and animation fallback policy for the image engine.
-    pub engine_limits: EngineLimits,
-    /// Maximum target width or height accepted in query parameters.
-    pub max_target_dimension: u32,
-    /// Maximum duration a request waits for a transform concurrency slot before returning `503`.
-    pub transform_queue_timeout: Duration,
-    /// `Cache-Control` header value emitted on image responses.
-    pub cache_control: String,
-    /// Optional secret token required by `POST /cache/cleanup`.
-    /// When `None` or empty, cleanup requests fail closed with `401 Unauthorized`.
-    pub cleanup_token: Option<String>,
-    /// Optional HMAC-SHA256 verifier requiring a valid `sig` parameter on `GET /load`.
-    pub request_signer: Option<RequestSigner>,
-    /// Validated named transformation presets (`[presets.<name>]`).
-    pub presets: PresetRegistry,
-    /// Pre-decoded policy-controlled watermarks (`[watermarks]`).
-    pub watermarks: WatermarkRegistry,
-    /// Validated per-origin transformation and delivery policies (`[origins.<kind>.policy]`).
-    pub origin_policies: OriginPolicies,
-    /// When `true`, negotiates output format from the `Accept` header when `f` is omitted.
-    pub accept_negotiation: bool,
-    /// When `true`, exposes Prometheus metrics at `GET /metrics`.
-    pub metrics_enabled: bool,
-    /// When `true`, emits extended `X-Original-*` / `X-Processed-*` diagnostic headers on cache MISS.
-    pub diagnostic_headers: bool,
-    coalescer: VariantCoalescer,
-    source_coalescer: SourceCoalescer,
-    transform_permits: Arc<Semaphore>,
-    metrics: Arc<Metrics>,
-}
-
-impl AppState {
-    /// Constructs application state from explicit optional origins and a cache.
-    #[must_use]
-    pub fn from_parts(
-        local_origin: Option<LocalFsOrigin>,
-        http_origin: Option<HttpOrigin>,
-        cache: FsCache,
-    ) -> Self {
-        Self {
-            local_origin,
-            http_origin,
-            s3_origin: None,
-            cache,
-            source_cache: None,
-            engine_limits: EngineLimits::default(),
-            max_target_dimension: DEFAULT_MAX_DIMENSION,
-            transform_queue_timeout: Duration::from_secs(DEFAULT_TRANSFORM_QUEUE_TIMEOUT_SECS),
-            cache_control: DEFAULT_CACHE_CONTROL.to_owned(),
-            cleanup_token: None,
-            request_signer: None,
-            presets: PresetRegistry::empty(),
-            watermarks: WatermarkRegistry::empty(),
-            origin_policies: OriginPolicies::default(),
-            accept_negotiation: false,
-            metrics_enabled: true,
-            diagnostic_headers: false,
-            coalescer: Coalescer::new(),
-            source_coalescer: Coalescer::new(),
-            transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
-            metrics: Arc::new(Metrics::new()),
-        }
-    }
-
-    /// Attaches an [`S3Origin`] for `s3://` asset requests.
-    #[must_use]
-    pub fn with_s3_origin(mut self, s3_origin: S3Origin) -> Self {
-        self.s3_origin = Some(s3_origin);
-        self
-    }
-
-    /// Attaches an optional raw-source [`FsCache`] for remote HTTP(S) and S3 origins.
-    #[must_use]
-    pub fn with_source_cache(mut self, source_cache: FsCache) -> Self {
-        self.source_cache = Some(source_cache);
-        self
-    }
-
-    /// Attaches pre-decoded policy-controlled watermarks (`[watermarks]`).
-    #[must_use]
-    pub fn with_watermarks(mut self, watermarks: WatermarkRegistry) -> Self {
-        self.watermarks = watermarks;
-        self
-    }
-
-    /// Attaches validated per-origin policies (`[origins.<kind>.policy]`).
-    #[must_use]
-    pub fn with_origin_policies(mut self, origin_policies: OriginPolicies) -> Self {
-        self.origin_policies = origin_policies;
-        self
-    }
-
-    /// Sets the maximum number of concurrent CPU-bound image transformations.
-    #[must_use]
-    pub fn with_max_concurrent_transforms(mut self, max_concurrent: usize) -> Self {
-        self.transform_permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
-        self
-    }
-
-    /// Constructs application state backed by a local filesystem origin and cache.
-    ///
-    /// Remote HTTP(S) fetching is disabled by default; attach an allowlisted
-    /// [`HttpOrigin`] via [`Self::with_http_origin`] to enable it.
-    #[must_use]
-    pub fn new(local_origin: LocalFsOrigin, cache: FsCache) -> Self {
-        Self::from_parts(Some(local_origin), None, cache)
-    }
-
-    /// Attaches an allowlisted [`HttpOrigin`] for remote `http://` and `https://` requests.
-    #[must_use]
-    pub fn with_http_origin(mut self, http_origin: HttpOrigin) -> Self {
-        self.http_origin = Some(http_origin);
-        self
-    }
-}
 
 /// Builds the Murklet Axum HTTP router.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -240,67 +88,6 @@ async fn load_handler(
     }
 }
 
-struct ResolvedLoad {
-    origin_id: &'static str,
-    origin_kind: OriginKind,
-    source: String,
-    spec: TransformSpec,
-    vary_accept: bool,
-    cache_control: String,
-}
-
-fn resolve_and_validate_load(
-    state: &AppState,
-    headers: &HeaderMap,
-    raw_query: RawLoadQuery,
-) -> Result<ResolvedLoad, HttpError> {
-    let source_preview = raw_query
-        .url
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| HttpError::BadRequest("query parameter 'url' is required".to_owned()))?;
-    let (origin_id, origin_kind) = resolve_origin_route(state, source_preview)?;
-    let origin_policy = state.origin_policies.for_origin_id(origin_id);
-
-    enforce_origin_query_policy(&raw_query, origin_policy)?;
-
-    let effective_max_dim = origin_policy.effective_max_dimension(state.max_target_dimension);
-    let mut parsed = parse_load_query_with_presets(raw_query, effective_max_dim, &state.presets)?;
-    let vary_accept = state.accept_negotiation && !parsed.explicit_format;
-    if vary_accept {
-        let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
-        parsed.spec.format = negotiate_format_allowed(accept, &origin_policy.allowed_formats);
-    }
-    if !origin_policy.is_format_allowed(parsed.spec.format) {
-        return Err(HttpError::Forbidden(format!(
-            "output format '{}' is not permitted for origin '{origin_id}'",
-            parsed.spec.format
-        )));
-    }
-    if parsed.spec.watermark.is_none() {
-        parsed.spec.watermark = origin_policy.default_watermark_spec();
-    }
-    if let Some(ref wm) = parsed.spec.watermark
-        && !state.watermarks.contains(&wm.name)
-    {
-        return Err(HttpError::BadRequest(format!(
-            "unknown watermark '{}'",
-            wm.name
-        )));
-    }
-
-    Ok(ResolvedLoad {
-        origin_id,
-        origin_kind,
-        source: parsed.source,
-        spec: parsed.spec,
-        vary_accept,
-        cache_control: origin_policy
-            .effective_cache_control(&state.cache_control)
-            .to_owned(),
-    })
-}
-
 async fn handle_load_inner(
     state: &Arc<AppState>,
     uri: &Uri,
@@ -314,99 +101,72 @@ async fn handle_load_inner(
         return Err(HttpError::Unauthorized);
     }
 
-    let resolved = resolve_and_validate_load(state, headers, raw_query)?;
-    let cache_key = CacheKey::from_parts(resolved.origin_id, &resolved.source, &resolved.spec);
+    let accept = headers.get(ACCEPT).and_then(|value| value.to_str().ok());
+    let resolved = resolve_and_validate_load(state, accept, raw_query)?;
     let if_none_match = headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    // Check cache on the blocking pool so disk I/O never stalls async worker threads.
-    let cache_lookup = {
-        let state = Arc::clone(state);
-        let key = cache_key.clone();
-        tokio::task::spawn_blocking(move || state.cache.get(&key))
-            .await
-            .map_err(|_| HttpError::Internal)?
-    };
-
-    if let Ok(Some(cached)) = cache_lookup {
-        let response = if etag_matches(if_none_match.as_deref(), &cached.etag) {
-            build_not_modified_response(
-                &cached.etag,
-                &resolved.cache_control,
-                "HIT",
-                resolved.vary_accept,
-            )
-        } else {
-            build_image_response(
-                Bytes::from(cached.bytes),
-                cached.format.mime_type(),
-                &cached.etag,
-                &resolved.cache_control,
-                "HIT",
-                resolved.vary_accept,
-                None,
-            )
-        };
-        record_load_success(
-            state,
-            resolved.origin_kind,
-            cached.format,
-            CacheOutcome::Hit,
-            response.status().as_u16(),
-            started,
-        );
-        return Ok(response);
-    }
-
-    // Cache miss: coalesce concurrent requests for the same canonical variant key.
-    let requested_quality = resolved.spec.quality.get();
-    let coalesced = state
-        .coalescer
-        .execute(cache_key.clone(), || {
-            let state = Arc::clone(state);
-            let source = resolved.source.clone();
-            let spec = resolved.spec.clone();
-            let key = cache_key.clone();
-            async move {
-                fetch_transform_and_cache(
-                    state,
-                    resolved.origin_id,
-                    resolved.origin_kind,
-                    source,
-                    spec,
-                    key,
+    match execute_load(state, &resolved).await? {
+        LoadExecution::Hit(cached) => {
+            let response = if etag_matches(if_none_match.as_deref(), &cached.etag) {
+                build_not_modified_response(
+                    &cached.etag,
+                    &resolved.cache_control,
+                    "HIT",
+                    resolved.vary_accept,
                 )
-                .await
-            }
-        })
-        .await;
-
-    let outcome = coalesced.value?;
-    let response = build_miss_response(
-        state,
-        &outcome,
-        requested_quality,
-        &resolved.cache_control,
-        if_none_match.as_deref(),
-        coalesced.was_coalesced,
-        resolved.vary_accept,
-    );
-    let cache_outcome = if coalesced.was_coalesced {
-        CacheOutcome::Coalesced
-    } else {
-        CacheOutcome::Miss
-    };
-    record_load_success(
-        state,
-        resolved.origin_kind,
-        outcome.format,
-        cache_outcome,
-        response.status().as_u16(),
-        started,
-    );
-    Ok(response)
+            } else {
+                build_image_response(
+                    Bytes::from(cached.bytes),
+                    cached.format.mime_type(),
+                    &cached.etag,
+                    &resolved.cache_control,
+                    "HIT",
+                    resolved.vary_accept,
+                    None,
+                )
+            };
+            record_load_success(
+                state,
+                resolved.origin_kind,
+                cached.format,
+                CacheOutcome::Hit,
+                response.status().as_u16(),
+                started,
+            );
+            Ok(response)
+        }
+        LoadExecution::Miss {
+            outcome,
+            was_coalesced,
+        } => {
+            let response = build_miss_response(
+                state,
+                &outcome,
+                resolved.spec.quality.get(),
+                &resolved.cache_control,
+                if_none_match.as_deref(),
+                was_coalesced,
+                resolved.vary_accept,
+            );
+            let cache_outcome = if was_coalesced {
+                CacheOutcome::Coalesced
+            } else {
+                CacheOutcome::Miss
+            };
+            record_load_success(
+                state,
+                resolved.origin_kind,
+                outcome.format,
+                cache_outcome,
+                response.status().as_u16(),
+                started,
+            );
+            Ok(response)
+        }
+    }
 }
 
 fn record_load_success(
@@ -430,254 +190,6 @@ fn record_load_success(
     );
 }
 
-fn resolve_origin_route(
-    state: &AppState,
-    source: &str,
-) -> Result<(&'static str, OriginKind), HttpError> {
-    if is_http_source(source) {
-        if state.http_origin.is_none() {
-            return Err(HttpError::Forbidden(
-                "remote HTTP(S) origins are disabled".to_owned(),
-            ));
-        }
-        Ok((HTTP_ORIGIN_ID, OriginKind::Http))
-    } else if is_s3_source(source) {
-        if state.s3_origin.is_none() {
-            return Err(HttpError::Forbidden("S3 origin is disabled".to_owned()));
-        }
-        Ok((S3_ORIGIN_ID, OriginKind::S3))
-    } else {
-        if state.local_origin.is_none() {
-            return Err(HttpError::Forbidden(
-                "local filesystem origin is disabled".to_owned(),
-            ));
-        }
-        Ok((LOCAL_ORIGIN_ID, OriginKind::Local))
-    }
-}
-
-fn enforce_origin_query_policy(
-    raw_query: &RawLoadQuery,
-    policy: &OriginPolicy,
-) -> Result<(), HttpError> {
-    let preset_name = raw_query.preset.as_deref().filter(|v| !v.is_empty());
-
-    if policy.presets_only {
-        if preset_name.is_none() {
-            return Err(HttpError::Forbidden(
-                "origin policy requires a named 'preset' parameter (presets_only)".to_owned(),
-            ));
-        }
-        if raw_query.has_transform_overrides() {
-            return Err(HttpError::Forbidden(
-                "ad-hoc transformation parameters are forbidden by origin policy (presets_only)"
-                    .to_owned(),
-            ));
-        }
-    }
-
-    if let Some(name) = preset_name
-        && !policy.is_preset_allowed(name)
-    {
-        return Err(HttpError::Forbidden(format!(
-            "preset '{name}' is not permitted for this origin"
-        )));
-    }
-
-    Ok(())
-}
-
-fn build_miss_response(
-    state: &AppState,
-    outcome: &MissOutcome,
-    requested_quality: u8,
-    cache_control: &str,
-    if_none_match: Option<&str>,
-    was_coalesced: bool,
-    vary_accept: bool,
-) -> Response {
-    let x_cache = if was_coalesced { "HIT" } else { "MISS" };
-
-    if etag_matches(if_none_match, &outcome.etag) {
-        return build_not_modified_response(&outcome.etag, cache_control, x_cache, vary_accept);
-    }
-
-    let diagnostics = (!was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
-        original_width: outcome.source_dimensions.width(),
-        original_height: outcome.source_dimensions.height(),
-        processed_width: outcome.output_dimensions.width(),
-        processed_height: outcome.output_dimensions.height(),
-        original_size: outcome.original_size,
-        processed_size: outcome.bytes.len(),
-        format: outcome.format.as_str(),
-        quality: requested_quality,
-        filter: outcome.filter.to_string(),
-    });
-
-    build_image_response(
-        outcome.bytes.clone(),
-        outcome.format.mime_type(),
-        &outcome.etag,
-        cache_control,
-        x_cache,
-        vary_accept,
-        diagnostics.as_ref(),
-    )
-}
-
-async fn fetch_transform_and_cache(
-    state: Arc<AppState>,
-    origin_id: &'static str,
-    origin_kind: OriginKind,
-    source: String,
-    spec: TransformSpec,
-    key: CacheKey,
-) -> Result<Arc<MissOutcome>, HttpError> {
-    let started = Instant::now();
-    let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source).await?;
-    let original_size = source_bytes.len();
-
-    // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
-    // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
-    let _permit = tokio::time::timeout(
-        state.transform_queue_timeout,
-        Arc::clone(&state.transform_permits).acquire_owned(),
-    )
-    .await
-    .map_err(|_| HttpError::ServiceUnavailable {
-        retry_after_secs: 2,
-    })?
-    .map_err(|_| HttpError::Internal)?;
-    let _in_flight = state.metrics.track_in_flight();
-
-    let metrics = Arc::clone(&state.metrics);
-    tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
-        let watermark = spec
-            .watermark
-            .as_ref()
-            .and_then(|wm| state.watermarks.get(&wm.name));
-        let output = engine::transform_with_watermark(
-            &source_bytes,
-            &spec,
-            &state.engine_limits,
-            watermark.as_deref(),
-        )?;
-
-        // Store transformed bytes under a key matching the actual output format
-        // (relevant if an animated source was passed through in its original format).
-        let effective_key = if output.format == key.format() {
-            key
-        } else {
-            let mut effective_spec = spec;
-            effective_spec.format = output.format;
-            CacheKey::from_parts(origin_id, &source, &effective_spec)
-        };
-
-        let etag = match state.cache.put(&effective_key, &output.bytes) {
-            Ok(stored) => stored.etag,
-            Err(_) => compute_etag(&output.bytes),
-        };
-
-        metrics.record_transform(origin_kind, output.format, started.elapsed());
-
-        Ok(Arc::new(MissOutcome {
-            bytes: Bytes::from(output.bytes),
-            format: output.format,
-            source_dimensions: output.source_dimensions,
-            output_dimensions: output.output_dimensions,
-            filter: output.filter,
-            original_size,
-            etag,
-        }))
-    })
-    .await
-    .map_err(|_| HttpError::Internal)?
-}
-
-/// Fetches raw source bytes, coalescing concurrent remote fetches and consulting
-/// the optional disk-backed `source_cache` for HTTP(S) and S3 origins.
-async fn fetch_source_bytes(
-    state: &Arc<AppState>,
-    origin_id: &'static str,
-    origin_kind: OriginKind,
-    source: &str,
-) -> Result<Bytes, HttpError> {
-    if origin_kind == OriginKind::Local {
-        let local_origin = state.local_origin.clone().ok_or_else(|| {
-            HttpError::Forbidden("local filesystem origin is disabled".to_owned())
-        })?;
-        let source_for_fs = source.to_owned();
-        let fetched = tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
-            .await
-            .map_err(|_| HttpError::Internal)??;
-        return Ok(Bytes::from(fetched.bytes));
-    }
-
-    let digest = source_digest_hex(origin_id, source);
-
-    if let Some(source_cache) = state.source_cache.clone() {
-        let digest_for_get = digest.clone();
-        if let Ok(Ok(Some(cached))) =
-            tokio::task::spawn_blocking(move || source_cache.get_raw(&digest_for_get)).await
-        {
-            return Ok(Bytes::from(cached));
-        }
-    }
-
-    let coalesced = state
-        .source_coalescer
-        .execute(digest.clone(), || {
-            let state = Arc::clone(state);
-            let source_owned = source.to_owned();
-            let digest_for_put = digest.clone();
-            async move {
-                let fetched = match origin_kind {
-                    OriginKind::Http => {
-                        let http_origin = state.http_origin.as_ref().ok_or_else(|| {
-                            HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
-                        })?;
-                        http_origin.fetch(&source_owned).await?
-                    }
-                    OriginKind::S3 => {
-                        let s3_origin = state.s3_origin.as_ref().ok_or_else(|| {
-                            HttpError::Forbidden("S3 origin is disabled".to_owned())
-                        })?;
-                        s3_origin.fetch(&source_owned).await?
-                    }
-                    OriginKind::Local => return Err(HttpError::Internal),
-                };
-
-                let bytes = Bytes::from(fetched.bytes);
-                if let Some(source_cache) = state.source_cache.clone() {
-                    let bytes_for_put = bytes.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = source_cache.put_raw(&digest_for_put, &bytes_for_put);
-                    })
-                    .await;
-                }
-                Ok(bytes)
-            }
-        })
-        .await;
-
-    coalesced.value
-}
-
-fn is_http_source(source: &str) -> bool {
-    source
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        || source
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-}
-
-fn is_s3_source(source: &str) -> bool {
-    source
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3://"))
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct CleanupQuery {
     url: Option<String>,
@@ -699,40 +211,6 @@ fn verify_cleanup_token(state: &AppState, headers: &HeaderMap) -> Result<(), Htt
         return Err(HttpError::Unauthorized);
     }
     Ok(())
-}
-
-async fn purge_source_entries(state: &Arc<AppState>, source_url: &str) -> Result<u64, HttpError> {
-    let origin_id = if is_http_source(source_url) {
-        HTTP_ORIGIN_ID
-    } else if is_s3_source(source_url) {
-        S3_ORIGIN_ID
-    } else {
-        LOCAL_ORIGIN_ID
-    };
-    let digest = source_digest_hex(origin_id, source_url);
-
-    let cache = state.cache.clone();
-    let source_cache = state.source_cache.clone();
-    let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
-        let mut count = cache.purge_source(&digest)?;
-        if let Some(src_cache) = source_cache
-            && src_cache.delete_raw(&digest)?
-        {
-            count += 1;
-        }
-        Ok(count)
-    })
-    .await
-    .map_err(|_| HttpError::Internal)??;
-
-    state.metrics.record_cache_cleanup();
-    tracing::info!(
-        origin = origin_id,
-        removed_files = removed,
-        "selective cache purge completed"
-    );
-
-    Ok(removed)
 }
 
 async fn purge_handler(
@@ -771,22 +249,46 @@ async fn cleanup_handler(
             .into_response());
     }
 
-    let cache = state.cache.clone();
-    let source_cache = state.source_cache.clone();
-    let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
-        let mut count = cache.cleanup()?;
-        if let Some(src_cache) = source_cache {
-            count += src_cache.cleanup()?;
-        }
-        Ok(count)
-    })
-    .await
-    .map_err(|_| HttpError::Internal)??;
-
-    state.metrics.record_cache_cleanup();
-    tracing::info!(removed_files = removed, "cache cleanup completed");
-
+    let _removed = cleanup_all_caches(&state).await?;
     Ok((StatusCode::OK, "Cache cleaned successfully").into_response())
+}
+
+fn build_miss_response(
+    state: &AppState,
+    outcome: &MissOutcome,
+    requested_quality: u8,
+    cache_control: &str,
+    if_none_match: Option<&str>,
+    was_coalesced: bool,
+    vary_accept: bool,
+) -> Response {
+    let x_cache = if was_coalesced { "HIT" } else { "MISS" };
+
+    if etag_matches(if_none_match, &outcome.etag) {
+        return build_not_modified_response(&outcome.etag, cache_control, x_cache, vary_accept);
+    }
+
+    let diagnostics = (!was_coalesced && state.diagnostic_headers).then(|| DiagnosticMeta {
+        original_width: outcome.source_dimensions.width(),
+        original_height: outcome.source_dimensions.height(),
+        processed_width: outcome.output_dimensions.width(),
+        processed_height: outcome.output_dimensions.height(),
+        original_size: outcome.original_size,
+        processed_size: outcome.bytes.len(),
+        format: outcome.format.as_str(),
+        quality: requested_quality,
+        filter: outcome.filter.to_string(),
+    });
+
+    build_image_response(
+        outcome.bytes.clone(),
+        outcome.format.mime_type(),
+        &outcome.etag,
+        cache_control,
+        x_cache,
+        vary_accept,
+        diagnostics.as_ref(),
+    )
 }
 
 struct DiagnosticMeta {
@@ -949,6 +451,13 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::application::load::LOCAL_ORIGIN_ID;
+    use crate::cache::{CacheKey, FsCache};
+    use crate::domain::{DEFAULT_MAX_DIMENSION, TransformSpec};
+    use crate::engine::WatermarkRegistry;
+    use crate::origin::LocalFsOrigin;
+    use crate::policy::{OriginPolicies, OriginPolicy, PresetRegistry, RequestSigner};
+    use std::time::Duration;
 
     static NEXT_HTTP_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1717,5 +1226,211 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(via_cleanup.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cache_read_and_write_errors_degrade_gracefully_and_increment_metrics() {
+        let fixture = TestFixture::new("cache-errors");
+        let local = LocalFsOrigin::new(&fixture.origin_dir, 1024 * 1024).unwrap();
+        // Tiny max_entry_bytes forces both `get` (when an oversized file sits on disk) and
+        // `put` (when the encoded variant exceeds 16 bytes) to return `CacheError::EntryTooLarge`.
+        let cache = FsCache::new(&fixture.cache_dir, 16).unwrap();
+
+        let spec = TransformSpec {
+            dimensions: crate::domain::TargetDimensions::new(
+                Some(crate::domain::Dimension::new(crate::domain::Axis::Width, 40, 8192).unwrap()),
+                None,
+            ),
+            format: OutputFormat::Jpeg,
+            ..TransformSpec::default()
+        };
+        let key = CacheKey::from_parts(LOCAL_ORIGIN_ID, "sample.png", &spec);
+        let entry_dir = fixture
+            .cache_dir
+            .join(key.shard_dir())
+            .join(key.source_digest_hex());
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join(key.file_name()), vec![0u8; 64]).unwrap();
+
+        let state = Arc::new(AppState::new(local, cache));
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-cache").unwrap(), "MISS");
+
+        let metrics_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+        let body = metrics_resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"read\"} 1\n"));
+        assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"write\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn saturated_pending_fetch_and_byte_limits_return_503_with_retry_after() {
+        let fixture = TestFixture::new("resource-isolation");
+
+        // 1. Saturated pending queue fails fast before fetching.
+        let mut pending_state = fixture.state().with_max_pending_transforms(1);
+        pending_state.transform_queue_timeout = Duration::from_secs(5);
+        let pending_state = Arc::new(pending_state);
+        let held_pending = Arc::clone(&pending_state.pending_transform_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let pending_resp = build_router(pending_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pending_resp.headers().get("retry-after").unwrap(), "2");
+        drop(held_pending);
+
+        // 2. Saturated fetch permits time out with 503 Retry-After.
+        let mut fetch_state = fixture.state().with_max_concurrent_fetches(1);
+        fetch_state.transform_queue_timeout = Duration::from_millis(30);
+        let fetch_state = Arc::new(fetch_state);
+        let held_fetch = Arc::clone(&fetch_state.fetch_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let fetch_resp = build_router(fetch_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fetch_resp.headers().get("retry-after").unwrap(), "2");
+        drop(held_fetch);
+
+        // 3. Saturated in-flight source byte budget times out with 503 Retry-After.
+        let mut byte_state = fixture.state().with_max_in_flight_source_bytes(1024);
+        byte_state.transform_queue_timeout = Duration::from_millis(30);
+        let byte_state = Arc::new(byte_state);
+        let _held_bytes = Arc::clone(&byte_state.in_flight_byte_permits)
+            .acquire_many_owned(1)
+            .await
+            .unwrap();
+        let byte_resp = build_router(byte_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(byte_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(byte_resp.headers().get("retry-after").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn purge_during_in_flight_transform_prevents_stale_cache_write() {
+        let fixture = TestFixture::new("purge-race");
+        let mut state = fixture.state().with_max_concurrent_transforms(1);
+        state.cleanup_token = Some("s3cr3t-token".to_owned());
+        state.transform_queue_timeout = Duration::from_secs(5);
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
+
+        // Hold the sole transform slot so the in-flight request fetches the old source
+        // bytes and pauses before transforming and writing to cache.
+        let held_transform = Arc::clone(&state.transform_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let in_flight_app = app.clone();
+        let in_flight = tokio::spawn(async move {
+            in_flight_app
+                .oneshot(
+                    Request::builder()
+                        .uri("/load?url=sample.png&w=40&f=jpeg")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        // Wait briefly for the in-flight request to register its FlightToken and pause
+        // on the transform semaphore.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Replace the source image on disk with a visually distinct colour and purge.
+        let updated = RgbaImage::from_pixel(100, 60, Rgba([220, 20, 40, 255]));
+        let mut updated_bytes = Vec::new();
+        DynamicImage::ImageRgba8(updated)
+            .write_to(&mut Cursor::new(&mut updated_bytes), ImageFormat::Png)
+            .unwrap();
+        fs::write(fixture.origin_dir.join("sample.png"), updated_bytes).unwrap();
+
+        let purge_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cache/purge?url=sample.png")
+                    .header("x-cache-cleanup-token", "s3cr3t-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purge_resp.status(), StatusCode::OK);
+
+        // Release the transform slot so the stale in-flight request completes.
+        drop(held_transform);
+        let stale_resp = in_flight.await.unwrap();
+        assert_eq!(stale_resp.status(), StatusCode::OK);
+        let stale_etag = stale_resp
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // Next request must MISS (stale write was skipped) and serve the updated source.
+        let fresh_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh_resp.status(), StatusCode::OK);
+        assert_eq!(fresh_resp.headers().get("x-cache").unwrap(), "MISS");
+        let fresh_etag = fresh_resp.headers().get(ETAG).unwrap().to_str().unwrap();
+        assert_ne!(fresh_etag, stale_etag);
     }
 }

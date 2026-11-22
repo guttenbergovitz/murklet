@@ -4,6 +4,36 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-11-22
+
+### Added
+
+- **Filesystem cache eviction benchmarks (`benches/cache_evict.rs`):** Added reproducible Criterion benchmarks measuring `FsCache::evict` traversal and oldest-`mtime` disk-budget eviction across sharded source-bucketed cache trees (`1,000` and `10,000` entries by default, plus `100,000` via `MURKLET_BENCH_LARGE=1`) to inform future cache indexing decisions with real measurements.
+
+## [0.7.2] - 2026-11-22
+
+### Changed
+
+- **Application orchestration extracted from HTTP router (`src/application/load.rs`, `src/http/router.rs`):** Moved policy resolution, cache lookup, singleflight coalescing, resource-isolation guards, origin fetching, image transformation, and cache invalidation orchestration out of `src/http/router.rs` into `src/application/load.rs`. `src/http/router.rs` now handles HTTP transport concerns only (routing, authentication checks, `ETag`/`If-None-Match`, diagnostic headers, and response formatting) while re-exporting `AppState` for backwards compatibility.
+
+## [0.7.1] - 2026-11-22
+
+### Fixed
+
+- **Linearisable cache invalidation against in-flight writes (`src/cache/invalidation.rs`, `src/http/router.rs`):** Added an RAII `InvalidationTracker` (`FlightToken` + shared/exclusive I/O gate) so `POST /cache/purge` and `POST /cache/cleanup` advance per-source or global generation epochs and prevent concurrent in-flight fetch/transform requests from repopulating stale variant or raw-source entries on disk after invalidation.
+
+## [0.7.0] - 2026-11-22
+
+### Added
+
+- **Bounded fetch concurrency, pending queue, and in-flight source memory budget (`src/policy/config.rs`, `src/http/router.rs`, `src/main.rs`):** Added `limits.max_concurrent_fetches` (default `32`), `limits.max_pending_transforms` (default `64`, shedding excess cache-miss load with `503 Retry-After` before touching any origin), and `limits.max_in_flight_source_bytes` (default `256 MiB`, bounding aggregate raw source bytes held in memory while waiting for or executing image transformations).
+
+## [0.6.1] - 2026-11-22
+
+### Fixed
+
+- **Cache read and write error observability (`src/http/metrics.rs`, `src/http/router.rs`):** Stopped silently treating filesystem cache read/write errors (`FsCache::get`, `FsCache::put`, `FsCache::get_raw`, `FsCache::put_raw`) as ordinary cache misses. Requests still degrade gracefully to origin, while emitting structured `tracing::warn!` logs and incrementing the low-cardinality Prometheus counter `murklet_cache_errors_total{cache="variant|source",op="read|write"}`.
+
 ## [0.6.0] - 2026-11-21
 
 ### Added
