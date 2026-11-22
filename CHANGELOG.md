@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-11-22
+
+### Fixed
+
+- **Pre-allocation byte budget on raw source-cache hits (`src/cache/fs.rs`, `src/cache/error.rs`, `src/application/load.rs`):** Added `FsCache::get_raw_with_budget` and `CacheError::BudgetExhausted` so `[cache.source]` hits reserve against `limits.max_in_flight_source_bytes` *before* allocating payload buffers rather than after reading the entire file into memory. Budget exhaustion returns `503 Retry-After` (`reason="byte_budget"`) instead of falling back to origin.
+
 ## [0.9.1] - 2026-11-22
 
 ### Added

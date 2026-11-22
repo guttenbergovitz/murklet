@@ -130,6 +130,27 @@ impl FsCache {
         self.read_entry_bytes(&path)
     }
 
+    /// Looks up raw source bytes while invoking `reserve(target_total_bytes)` *before*
+    /// allocating the payload buffer or extending it on concurrent file growth.
+    ///
+    /// Returns `Ok(None)` on cache miss or TTL expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::BudgetExhausted`] when `reserve` rejects the allocation,
+    /// [`CacheError::EntryTooLarge`], or [`CacheError::Io`].
+    pub fn get_raw_with_budget<F>(
+        &self,
+        digest_hex: &str,
+        mut reserve: F,
+    ) -> Result<Option<Vec<u8>>, CacheError>
+    where
+        F: FnMut(usize) -> Result<(), CacheError>,
+    {
+        let path = self.raw_entry_path(digest_hex);
+        self.read_entry_bytes_with_budget(&path, Some(&mut reserve))
+    }
+
     /// Stores raw source bytes atomically under `<shard>/<digest>.src`.
     ///
     /// # Errors
@@ -150,7 +171,15 @@ impl FsCache {
     }
 
     fn read_entry_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
-        let file = match File::open(path) {
+        self.read_entry_bytes_with_budget(path, None)
+    }
+
+    fn read_entry_bytes_with_budget(
+        &self,
+        path: &Path,
+        mut reserve: Option<&mut dyn FnMut(usize) -> Result<(), CacheError>>,
+    ) -> Result<Option<Vec<u8>>, CacheError> {
+        let mut file = match File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(CacheError::Io(err.kind().to_string())),
@@ -180,24 +209,34 @@ impl FsCache {
             });
         }
 
-        let read_limit = u64::try_from(self.max_entry_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-
         let initial_cap = usize::try_from(metadata.len())
             .unwrap_or(0)
             .min(self.max_entry_bytes);
+        if initial_cap > 0
+            && let Some(cb) = reserve.as_deref_mut()
+        {
+            cb(initial_cap)?;
+        }
         let mut bytes = Vec::with_capacity(initial_cap);
-
-        file.take(read_limit)
-            .read_to_end(&mut bytes)
-            .map_err(|err| CacheError::Io(err.kind().to_string()))?;
-
-        if bytes.len() > self.max_entry_bytes {
-            return Err(CacheError::EntryTooLarge {
-                size: bytes.len(),
-                max: self.max_entry_bytes,
-            });
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|err| CacheError::Io(err.kind().to_string()))?;
+            if read == 0 {
+                break;
+            }
+            let new_len = bytes.len().saturating_add(read);
+            if new_len > self.max_entry_bytes {
+                return Err(CacheError::EntryTooLarge {
+                    size: new_len,
+                    max: self.max_entry_bytes,
+                });
+            }
+            if let Some(cb) = reserve.as_deref_mut() {
+                cb(new_len)?;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
         }
 
         Ok(Some(bytes))
@@ -790,5 +829,30 @@ mod tests {
         assert!(cache.delete_raw(&digest_a).unwrap());
         assert!(!cache.delete_raw(&digest_a).unwrap());
         assert_eq!(cache.get_raw(&digest_a).unwrap(), None);
+    }
+
+    #[test]
+    fn get_raw_with_budget_reserves_before_reading_and_aborts_on_exhaustion() {
+        let dir = TempCacheDir::new("raw-budget");
+        let cache = FsCache::new(&dir.path, 64 * 1024).unwrap();
+        let digest = crate::cache::source_digest_hex("http", "https://cdn.example.com/big.png");
+        let payload = vec![0xCDu8; 4096];
+        cache.put_raw(&digest, &payload).unwrap();
+
+        // Rejecting reservation before reading returns BudgetExhausted.
+        let mut observed_target = 0usize;
+        let rejected = cache.get_raw_with_budget(&digest, |target| {
+            observed_target = target;
+            Err(CacheError::BudgetExhausted)
+        });
+        assert_eq!(rejected, Err(CacheError::BudgetExhausted));
+        assert_eq!(observed_target, 4096);
+
+        // Approving reservation returns the full cached payload.
+        let ok = cache
+            .get_raw_with_budget(&digest, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok, payload);
     }
 }
