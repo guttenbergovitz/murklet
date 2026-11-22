@@ -6,7 +6,7 @@ Murklet is an open-source image proxy and on-demand image transformation service
 
 It fetches images from trusted sources, transforms and optimises them, caches the results, and serves them efficiently over HTTP. Its emphasis is straightforward: dependable image delivery first, backed by explicit policies, predictable caching, and practical observability.
 
-> **Project status:** `v0.9.6` (early release). Implemented and tested: local filesystem, SSRF-hardened HTTP(S), and pure-Rust S3-compatible (`SigV4`) origins; per-origin transformation and delivery policies (`[origins.<kind>.policy]` with `presets_only`, preset/format allowlists, dimension caps, default watermarks, and `Cache-Control` overrides); pure-Rust static image engine with SIMD `fast_image_resize` (JPEG, PNG, WebP, GIF, and AVIF), fit/cover/contain/scale-down cropping with gravity & focal points, rotation, DPR, alpha flattening, post-resize colour/tonal/monochrome & creative filters (`duotone`, `posterize`, `threshold`, `pixelate`, `vignette`), and policy-controlled watermarks (`[watermarks]`); source-bucketed filesystem variant & optional raw-source cache with request coalescing, TTL expiry, disk-budget eviction, $O(1)$ selective per-source invalidation (`POST /cache/purge`) guarded by linearisable invalidation epochs, and explicit cache-error telemetry; four-stage resource isolation (`max_pending_transforms`, `max_concurrent_fetches`, pre-allocation/streaming `max_in_flight_source_bytes`, and cancellation-safe `max_concurrent_transforms` returning `503 Retry-After`); declarative TOML configuration with named presets, `murklet explain`, `murklet test-policy`, and `murklet sign`; optional HMAC-SHA256 request signing; `Accept` format negotiation; structured `tracing` logs; Prometheus `/metrics`; pressure/cancellation stress tests (`task stress`), deterministic boundary-fuzz tests, and Criterion benchmarks (`task bench`). Path-based URL routes and OpenTelemetry exporters remain planned.
+> **Project status:** early release (`0.x`; minor versions may introduce breaking changes). The image proxy core, three origins (local, SSRF-hardened HTTP(S), S3-compatible), per-origin policies, two-tier filesystem cache, and bounded resource isolation are implemented and tested. See the [Changelog](CHANGELOG.md) for the current version and history, [Roadmap](#roadmap-and-milestones) for what is planned, and [Documentation](#documentation) for guides. Path-based URL routes and OpenTelemetry export remain planned.
 
 ## Motivation
 
@@ -220,7 +220,7 @@ Murklet is not a digital asset manager, browser image editor, image generation s
 
 ## Quickstart
 
-Requires Rust 1.85+ (edition 2024). If you have [Task](https://taskfile.dev/) installed, common development workflows are available in [Taskfile.yml](Taskfile.yml):
+Requires Rust 1.88+ (edition 2024; the code uses `let` chains). If you have [Task](https://taskfile.dev/) installed, common development workflows are available in [Taskfile.yml](Taskfile.yml):
 
 ```bash
 # Run the full CI gate (format, Clippy, tests)
@@ -236,13 +236,16 @@ task smoke
 cargo run -- explain "/load?url=sample.png&w=400&f=webp" murklet.example.toml
 
 # Run a declarative TOML policy test suite offline (CI verification)
-cargo run -- test-policy policy-tests.toml murklet.toml
+cargo run -- test-policy policy-tests.example.toml murklet.example.toml
 
 # Generate a signed /load URL when server.signing_secret is configured
 cargo run -- sign "/load?url=sample.png&w=400&f=webp" murklet.toml
 
 # Run reproducible image-engine and cache-eviction benchmarks
 task bench
+
+# Measure RSS, CPU, and latency of a live release build (see docs/benchmarks.md)
+task bench:live
 
 # Run pressure and concurrency stress tests (stampede, backpressure, cancellation, purge)
 task stress
@@ -280,15 +283,17 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cle
 To build a minimal container image:
 
 ```bash
-docker build -t murklet:0.9.6 .
+task docker:build   # or: docker build -t murklet:local .
 ```
 
 ## Documentation
 
-- [Engineering and Git Conventions](docs/conventions.md) — coding standards, Git Flow, SemVer, and commit guidelines.
-- [Architecture Decision Records](docs/adr/README.md) — lightweight record of key technical decisions ([ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md), [ADR 0002](docs/adr/0002-single-crate-module-boundaries.md), [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md), [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
+- [Documentation index](docs/README.md) — where to find what.
+- [Operations guide](docs/operations.md) — container usage, `503` reasons and tuning, memory sizing, cache and purge behaviour, metrics reference.
 - [Empirical Benchmarks & Resource Sizing](docs/benchmarks.md) — measured RSS, CPU, p50/p95/p99 latency, backpressure behaviour, and cache eviction timings.
-- [Example Configuration](murklet.example.toml) — annotated TOML policy reference.
+- [Architecture Decision Records](docs/adr/README.md) — why key decisions were made ([ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md), [ADR 0002](docs/adr/0002-single-crate-module-boundaries.md), [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md), [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
+- [Engineering and Git Conventions](docs/conventions.md) — coding standards, Git Flow, SemVer, commit guidelines, and the local quality gate.
+- [Example Configuration](murklet.example.toml) and [Example Policy Test Suite](policy-tests.example.toml) — annotated starting points.
 - [Changelog](CHANGELOG.md) — release history.
 
 ## Licence

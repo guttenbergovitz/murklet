@@ -33,6 +33,16 @@ Standards for code, documentation, branching, and commits in Murklet.
 - Treat `clippy` warnings seriously, including strict lints against unintended `unwrap_used` / `expect_used` in library and binary code.
 - Prefer test-driven development (TDD): define expected behaviour and failure modes in tests alongside or before implementation.
 
+## Local quality gate
+
+Run the same checks as CI before every commit:
+
+```bash
+task check      # rustfmt check, clippy (-D warnings), rustdoc (-D warnings), and tests
+```
+
+Without Task: `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`. Other useful tasks: `task stress` (concurrency and backpressure suite), `task bench` (Criterion), `task bench:live` (RSS/CPU/latency of a release build), and `task --list` for the rest.
+
 ## Branching and releases (Git Flow + SemVer)
 
 Murklet uses classic **Git Flow** with **Semantic Versioning (`MAJOR.MINOR.PATCH`)**:

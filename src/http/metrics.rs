@@ -266,7 +266,7 @@ pub struct Metrics {
     backpressure_rejections: [AtomicU64; 4],
 }
 
-/// RAII guard tracking an active image transformation in [`Metrics::in_flight_transforms`].
+/// RAII guard tracking an active image transformation in the `murklet_in_flight_transforms` gauge.
 pub struct InFlightGuard {
     metrics: Arc<Metrics>,
 }
@@ -279,7 +279,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// RAII guard tracking an active origin fetch in [`Metrics::in_flight_fetches`].
+/// RAII guard tracking an active origin fetch in the `murklet_in_flight_fetches` gauge.
 pub struct InFlightFetchGuard {
     metrics: Arc<Metrics>,
 }
@@ -292,7 +292,7 @@ impl Drop for InFlightFetchGuard {
     }
 }
 
-/// RAII guard tracking raw source bytes held in memory in [`Metrics::in_flight_source_bytes`].
+/// RAII guard tracking raw source bytes held in memory in the `murklet_in_flight_source_bytes` gauge.
 pub struct InFlightBytesGuard {
     metrics: Arc<Metrics>,
     bytes: usize,

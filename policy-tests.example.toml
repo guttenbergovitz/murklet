@@ -1,0 +1,29 @@
+# Example declarative policy test suite for `murklet test-policy`.
+#
+#   cargo run -- test-policy policy-tests.example.toml murklet.example.toml
+#
+# Each [[case]] evaluates a request offline (no origin fetch, no transform) against the
+# configuration and asserts the decision plus any optional resolved values. Run this in
+# CI to catch policy regressions before deployment. Unknown keys fail fast.
+#
+# Required keys: `name`, `request`, `expect` ("allow" | "deny").
+# Optional assertions: `accept`, `origin`, `preset`, `format`, `width`, `height`,
+# `watermark`, `vary_accept`, `reason_contains`.
+
+[[case]]
+name = "local origin resizes and encodes to WebP"
+request = "/load?url=sample.png&w=400&f=webp"
+expect = "allow"
+origin = "local"
+format = "webp"
+width = 400
+
+[[case]]
+name = "path traversal is rejected before any filesystem access"
+request = "/load?url=../etc/passwd&w=100"
+expect = "deny"
+
+[[case]]
+name = "remote hosts are denied while the HTTP origin is disabled"
+request = "/load?url=https://untrusted.example.com/a.png&w=100"
+expect = "deny"
