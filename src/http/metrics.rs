@@ -257,7 +257,7 @@ pub struct Metrics {
     transforms: [[AtomicU64; 5]; 3],
     in_flight_transforms: AtomicUsize,
     in_flight_fetches: AtomicUsize,
-    in_flight_source_bytes: AtomicUsize,
+    in_flight_source_bytes: Arc<AtomicUsize>,
     transform_buckets: [AtomicU64; 10],
     transform_count: AtomicU64,
     transform_sum_micros: AtomicU64,
@@ -353,6 +353,13 @@ impl Metrics {
         InFlightFetchGuard {
             metrics: Arc::clone(self),
         }
+    }
+
+    /// Returns a shared handle to the live `murklet_in_flight_source_bytes` gauge
+    /// so streaming origin budgets can update it directly before allocation.
+    #[must_use]
+    pub fn in_flight_source_bytes_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.in_flight_source_bytes)
     }
 
     /// Adds `bytes` to `murklet_in_flight_source_bytes` and returns an RAII guard

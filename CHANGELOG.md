@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-11-22
+
+### Changed
+
+- **Pre-allocation and incremental streaming memory budget (`src/origin/budget.rs`, `src/origin/{local,http,s3}.rs`, `src/application/load.rs`):** Enforced `limits.max_in_flight_source_bytes` *before* allocating payload buffers or appending streamed HTTP/S3/local chunks via `ByteBudget` and RAII `ByteReservation` (updating `murklet_in_flight_source_bytes` live during streaming and returning `503 Retry-After` with `reason="byte_budget"` mid-stream when exhausted). Coalesced remote fetches share a single `Arc<ReservedSource>` so physical buffers are accounted once until the last consumer finishes transforming.
+
 ## [0.8.4] - 2026-11-22
 
 ### Fixed

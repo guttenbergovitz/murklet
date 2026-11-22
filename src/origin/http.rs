@@ -12,6 +12,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 
+use crate::origin::budget::ByteReservation;
 use crate::origin::error::OriginError;
 use crate::origin::local::FetchedImage;
 use crate::origin::ssrf::{HostAllowlist, is_forbidden_ip, validate_remote_url};
@@ -157,6 +158,29 @@ impl HttpOrigin {
     /// Returns a typed [`OriginError`] on policy violation, SSRF rejection, redirect limit,
     /// upstream non-200 status, timeout, or oversized response body.
     pub async fn fetch(&self, raw_url: &str) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_url, None).await
+    }
+
+    /// Fetches image bytes from `raw_url` while reserving memory against `reservation`
+    /// *before* pre-allocating `Content-Length` or appending each streamed chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::BudgetExhausted`] when the aggregate in-flight source memory
+    /// budget is exhausted, or another [`OriginError`] on policy/SSRF/transport failure.
+    pub async fn fetch_with_budget(
+        &self,
+        raw_url: &str,
+        reservation: &mut ByteReservation,
+    ) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_url, Some(reservation)).await
+    }
+
+    async fn fetch_inner(
+        &self,
+        raw_url: &str,
+        mut reservation: Option<&mut ByteReservation>,
+    ) -> Result<FetchedImage, OriginError> {
         let mut current_url = validate_remote_url(raw_url, &self.allowlist, self.enforce_ip_block)?;
         let mut redirects_followed: u8 = 0;
 
@@ -216,6 +240,11 @@ impl HttpOrigin {
                 .and_then(|len| usize::try_from(len).ok())
                 .unwrap_or(0)
                 .min(self.max_bytes);
+            if initial_cap > 0
+                && let Some(res) = reservation.as_deref_mut()
+            {
+                res.reserve_total(initial_cap).await?;
+            }
             let mut bytes = Vec::with_capacity(initial_cap);
 
             while let Some(chunk) = response
@@ -229,6 +258,9 @@ impl HttpOrigin {
                         size: new_len,
                         max: self.max_bytes,
                     });
+                }
+                if let Some(res) = reservation.as_deref_mut() {
+                    res.reserve_total(new_len).await?;
                 }
                 bytes.extend_from_slice(&chunk);
             }

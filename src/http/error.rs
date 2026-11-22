@@ -71,6 +71,9 @@ impl From<OriginError> for HttpError {
             OriginError::PayloadTooLarge { size, max } => Self::PayloadTooLarge(format!(
                 "source image ({size} bytes) exceeds limit of {max} bytes"
             )),
+            OriginError::BudgetExhausted => Self::ServiceUnavailable {
+                retry_after_secs: 2,
+            },
             OriginError::InvalidRoot(_) | OriginError::Io(_) => Self::Internal,
         }
     }

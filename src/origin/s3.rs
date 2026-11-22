@@ -13,6 +13,7 @@ use reqwest::redirect::Policy;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::origin::budget::ByteReservation;
 use crate::origin::error::OriginError;
 use crate::origin::http::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_FETCH_TIMEOUT};
 use crate::origin::local::FetchedImage;
@@ -168,6 +169,29 @@ impl S3Origin {
     /// upstream 404, [`OriginError::PayloadTooLarge`] when exceeding `max_bytes`,
     /// [`OriginError::Timeout`] on timeout, or [`OriginError::UpstreamStatus`] / [`OriginError::Io`].
     pub async fn fetch(&self, raw_source: &str) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_source, None).await
+    }
+
+    /// Fetches an S3 object while reserving memory against `reservation` *before*
+    /// pre-allocating `Content-Length` or appending each streamed chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::BudgetExhausted`] when the aggregate in-flight source memory
+    /// budget is exhausted, or another [`OriginError`] on key/transport/status failure.
+    pub async fn fetch_with_budget(
+        &self,
+        raw_source: &str,
+        reservation: &mut ByteReservation,
+    ) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_source, Some(reservation)).await
+    }
+
+    async fn fetch_inner(
+        &self,
+        raw_source: &str,
+        mut reservation: Option<&mut ByteReservation>,
+    ) -> Result<FetchedImage, OriginError> {
         let relative_key = validate_s3_key(raw_source)?;
         let full_key = match &self.prefix {
             Some(prefix) => format!("{prefix}/{relative_key}"),
@@ -225,6 +249,11 @@ impl S3Origin {
             .and_then(|len| usize::try_from(len).ok())
             .unwrap_or(0)
             .min(self.max_bytes);
+        if initial_cap > 0
+            && let Some(res) = reservation.as_deref_mut()
+        {
+            res.reserve_total(initial_cap).await?;
+        }
         let mut bytes = Vec::with_capacity(initial_cap);
 
         while let Some(chunk) = response.chunk().await.map_err(|err| {
@@ -240,6 +269,9 @@ impl S3Origin {
                     size: new_len,
                     max: self.max_bytes,
                 });
+            }
+            if let Some(res) = reservation.as_deref_mut() {
+                res.reserve_total(new_len).await?;
             }
             bytes.extend_from_slice(&chunk);
         }
