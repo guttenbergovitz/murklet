@@ -268,6 +268,13 @@ impl S3Origin {
             }
         })? {
             let new_len = bytes.len().saturating_add(chunk.len());
+            if let Some(expected) = content_length
+                && new_len > expected
+            {
+                return Err(OriginError::Io(
+                    "S3 response body exceeded declared Content-Length".to_owned(),
+                ));
+            }
             if new_len > self.max_bytes {
                 return Err(OriginError::PayloadTooLarge {
                     size: new_len,
