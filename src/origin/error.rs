@@ -35,6 +35,8 @@ pub enum OriginError {
         /// Configured maximum permitted size in bytes.
         max: usize,
     },
+    /// Aggregate in-flight source memory budget (`limits.max_in_flight_source_bytes`) was exhausted.
+    BudgetExhausted,
     /// Unexpected I/O or transport failure while reading from the origin.
     Io(String),
 }
@@ -61,6 +63,9 @@ impl fmt::Display for OriginError {
                     f,
                     "origin payload size {size} bytes exceeds maximum of {max} bytes"
                 )
+            }
+            Self::BudgetExhausted => {
+                f.write_str("in-flight source memory budget exhausted while fetching from origin")
             }
             Self::Io(reason) => write!(f, "origin I/O failure: {reason}"),
         }

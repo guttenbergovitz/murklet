@@ -4,6 +4,25 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-11-22
+
+### Added
+
+- **Streaming budget & cancellation stress tests (`src/origin/http.rs`, `tests/pressure_stress.rs`, `docs/adr/0004-resource-isolation-and-invalidation-semantics.md`):** Added a chunked slow-HTTP origin test verifying mid-stream `OriginError::BudgetExhausted` rejection and zero leaked bytes, added a mixed cancellation/overload stress test confirming all `murklet_in_flight_*` gauges settle cleanly to `0`, and updated ADR 0004 with the incremental streaming budget, `spawn_blocking` permit binding, and explicit invalidation contract.
+
+## [0.9.0] - 2026-11-22
+
+### Changed
+
+- **Pre-allocation and incremental streaming memory budget (`src/origin/budget.rs`, `src/origin/{local,http,s3}.rs`, `src/application/load.rs`):** Enforced `limits.max_in_flight_source_bytes` *before* allocating payload buffers or appending streamed HTTP/S3/local chunks via `ByteBudget` and RAII `ByteReservation` (updating `murklet_in_flight_source_bytes` live during streaming and returning `503 Retry-After` with `reason="byte_budget"` mid-stream when exhausted). Coalesced remote fetches share a single `Arc<ReservedSource>` so physical buffers are accounted once until the last consumer finishes transforming.
+
+## [0.8.4] - 2026-11-22
+
+### Fixed
+
+- **Cancellation-safe permit and gauge lifetimes (`src/application/load.rs`):** Moved `pending_permit`, `transform_permit`, `byte_permit`, and their RAII metric guards into the `spawn_blocking` closure so client disconnects mid-transform cannot release concurrency or memory slots while CPU-bound encoding is still running. Raw source bytes and their memory permits are released immediately after transformation completes.
+- **Accurate transform duration histogram (`src/application/load.rs`, `src/http/metrics.rs`):** Scoped `murklet_transform_duration_seconds` to CPU-bound decoding, transformation, and encoding inside `spawn_blocking` rather than including origin fetch and queue wait time.
+
 ## [0.8.3] - 2026-11-22
 
 ### Added

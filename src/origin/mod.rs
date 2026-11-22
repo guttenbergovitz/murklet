@@ -1,12 +1,14 @@
 //! Image source adapters for fetching bytes from trusted origins (HTTP(S),
 //! local filesystem, and S3-compatible object storage) under strict safety guards.
 
+pub mod budget;
 pub mod error;
 pub mod http;
 pub mod local;
 pub mod s3;
 pub mod ssrf;
 
+pub use budget::{ByteBudget, ByteReservation, bytes_to_kib_permits};
 pub use error::OriginError;
 pub use http::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_FETCH_TIMEOUT, DEFAULT_MAX_REDIRECTS, HttpOrigin,
