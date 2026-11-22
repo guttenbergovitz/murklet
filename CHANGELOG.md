@@ -4,6 +4,16 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] - 2026-11-22
+
+### Added
+
+- **Singleflight cancellation + purge interaction tests (`src/cache/coalesce.rs`, `src/http/router.rs`):** Added deterministic tests verifying that aborting a singleflight leader hands leadership cleanly to a waiting follower, that a concurrent `POST /cache/purge` prevents pre-purge flights from writing stale entries to disk, and that all permits and in-flight gauges return to zero.
+
+### Changed
+
+- **Clarified source byte budget vs process RSS (`docs/adr/0004-resource-isolation-and-invalidation-semantics.md`, `murklet.example.toml`, `README.md`):** Documented explicitly that `limits.max_in_flight_source_bytes` bounds raw in-flight source payloads only (not total process RSS), while decoded pixel and transform working memory is bounded separately by `max_concurrent_transforms`, `max_decoded_pixels`, and `max_target_dimension`.
+
 ## [0.9.3] - 2026-11-22
 
 ### Fixed
