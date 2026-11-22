@@ -4,6 +4,17 @@ Practical notes for running Murklet: what the metrics mean, which limit to tune 
 
 ## Running in a container
 
+Pre-built multi-arch images (`linux/amd64` and `linux/arm64`) are published to Docker Hub on every `v*.*.*` release tag:
+
+```bash
+docker run --rm -p 9876:9876 \
+  -v "$PWD/assets:/app/assets:ro" \
+  -v murklet-cache:/app/cache \
+  guttenbergovitz/murklet:latest
+```
+
+Pin a specific release tag (for example `guttenbergovitz/murklet:0.9.7`) in production. To build locally instead:
+
 ```bash
 docker build -t murklet:local .          # or: task docker:build
 docker run --rm -p 9876:9876 \
@@ -13,6 +24,13 @@ docker run --rm -p 9876:9876 \
 ```
 
 The image runs as a non-root user (`uid 10001`) and listens on `0.0.0.0:9876` using the bundled `murklet.example.toml`. To use your own configuration, mount it over `/app/murklet.toml` and keep `server.bind` reachable from outside the container (`0.0.0.0:9876`). Validate any configuration offline first with `murklet --check <file>`.
+
+### Publishing releases to Docker Hub (maintainers)
+
+`.github/workflows/docker-publish.yml` builds and pushes `linux/amd64` and `linux/arm64` images (with BuildKit provenance and SBOM attestations) whenever a `v*.*.*` tag is pushed. Configure two repository secrets in GitHub Settings → Secrets and variables → Actions:
+
+- `DOCKERHUB_USERNAME` — Docker Hub account username (`guttenbergovitz`).
+- `DOCKERHUB_TOKEN` — Docker Hub Personal Access Token with **Read & Write** scope.
 
 ## Reading `503 Retry-After`
 

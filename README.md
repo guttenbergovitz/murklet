@@ -280,9 +280,15 @@ curl -X POST -H "X-Cache-Cleanup-Token: <token>" \
 curl -X POST -H "X-Cache-Cleanup-Token: <token>" http://127.0.0.1:9876/cache/cleanup
 ```
 
-To build a minimal container image:
+To run the published multi-arch container image (`linux/amd64`, `linux/arm64`) from Docker Hub, or build locally:
 
 ```bash
+docker run --rm -p 9876:9876 \
+  -v "$PWD/assets:/app/assets:ro" \
+  -v murklet-cache:/app/cache \
+  guttenbergovitz/murklet:latest
+
+# Or build locally
 task docker:build   # or: docker build -t murklet:local .
 ```
 
@@ -298,4 +304,9 @@ task docker:build   # or: docker build -t murklet:local .
 
 ## Licence
 
-Licence to be selected before the first public release.
+Dual-licensed under either of:
+
+- [MIT Licence](LICENSE-MIT)
+- [Apache Licence, Version 2.0](LICENSE-APACHE)
+
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Murklet shall be dual-licensed as above, without any additional terms or conditions.
