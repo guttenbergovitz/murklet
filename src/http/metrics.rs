@@ -441,7 +441,7 @@ impl Metrics {
         let sum_secs_whole = sum_micros / 1_000_000;
         let sum_secs_frac = sum_micros % 1_000_000;
 
-        out.push_str("# HELP murklet_transform_duration_seconds Duration of image fetch, transform, and cache write in seconds.\n");
+        out.push_str("# HELP murklet_transform_duration_seconds Duration of CPU-bound image decoding, transformation, and encoding in seconds.\n");
         out.push_str("# TYPE murklet_transform_duration_seconds histogram\n");
         for (idx, label) in DURATION_BUCKET_LABELS.iter().enumerate() {
             let bucket_count = self.transform_buckets[idx].load(Ordering::Relaxed);

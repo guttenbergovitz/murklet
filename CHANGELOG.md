@@ -4,6 +4,13 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.4] - 2026-11-22
+
+### Fixed
+
+- **Cancellation-safe permit and gauge lifetimes (`src/application/load.rs`):** Moved `pending_permit`, `transform_permit`, `byte_permit`, and their RAII metric guards into the `spawn_blocking` closure so client disconnects mid-transform cannot release concurrency or memory slots while CPU-bound encoding is still running. Raw source bytes and their memory permits are released immediately after transformation completes.
+- **Accurate transform duration histogram (`src/application/load.rs`, `src/http/metrics.rs`):** Scoped `murklet_transform_duration_seconds` to CPU-bound decoding, transformation, and encoding inside `spawn_blocking` rather than including origin fetch and queue wait time.
+
 ## [0.8.3] - 2026-11-22
 
 ### Added

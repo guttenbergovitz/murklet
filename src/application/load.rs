@@ -526,11 +526,9 @@ async fn fetch_transform_and_cache(
     spec: TransformSpec,
     key: CacheKey,
 ) -> Result<Arc<MissOutcome>, HttpError> {
-    let started = Instant::now();
-
     // Shed excess cache-miss load immediately before touching any origin so the
     // queue waiting for CPU transform slots stays strictly bounded.
-    let _pending_permit = Arc::clone(&state.pending_transform_permits)
+    let pending_permit = Arc::clone(&state.pending_transform_permits)
         .try_acquire_owned()
         .map_err(|_| reject_backpressure(&state, BackpressureReason::PendingQueue))?;
 
@@ -547,38 +545,51 @@ async fn fetch_transform_and_cache(
     if source_kib > state.in_flight_source_budget_kib {
         return Err(reject_backpressure(&state, BackpressureReason::ByteBudget));
     }
-    let _byte_permit = tokio::time::timeout(
+    let byte_permit = tokio::time::timeout(
         state.transform_queue_timeout,
         Arc::clone(&state.in_flight_byte_permits).acquire_many_owned(source_kib),
     )
     .await
     .map_err(|_| reject_backpressure(&state, BackpressureReason::ByteBudget))?
     .map_err(|_| HttpError::Internal)?;
-    let _in_flight_bytes = state.metrics.track_in_flight_source_bytes(original_size);
+    let in_flight_bytes = state.metrics.track_in_flight_source_bytes(original_size);
 
     // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
     // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
-    let _permit = tokio::time::timeout(
+    let transform_permit = tokio::time::timeout(
         state.transform_queue_timeout,
         Arc::clone(&state.transform_permits).acquire_owned(),
     )
     .await
     .map_err(|_| reject_backpressure(&state, BackpressureReason::TransformTimeout))?
     .map_err(|_| HttpError::Internal)?;
-    let _in_flight = state.metrics.track_in_flight();
+    let in_flight_transform = state.metrics.track_in_flight();
 
     let metrics = Arc::clone(&state.metrics);
+    // Move all permits and RAII gauges into the blocking task so client cancellation
+    // cannot release concurrency or memory slots while CPU work is still executing.
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
+        let _pending_permit = pending_permit;
+        let _transform_permit = transform_permit;
+        let _in_flight_transform = in_flight_transform;
+
         let watermark = spec
             .watermark
             .as_ref()
             .and_then(|wm| state.watermarks.get(&wm.name));
+        let transform_started = Instant::now();
         let output = engine::transform_with_watermark(
             &source_bytes,
             &spec,
             &state.engine_limits,
             watermark.as_deref(),
         )?;
+        let transform_elapsed = transform_started.elapsed();
+
+        // Release raw source bytes and their memory permits as soon as transformation finishes.
+        drop(source_bytes);
+        drop(in_flight_bytes);
+        drop(byte_permit);
 
         // Store transformed bytes under a key matching the actual output format
         // (relevant if an animated source was passed through in its original format).
@@ -614,7 +625,7 @@ async fn fetch_transform_and_cache(
             }
         };
 
-        metrics.record_transform(origin_kind, output.format, started.elapsed());
+        metrics.record_transform(origin_kind, output.format, transform_elapsed);
 
         Ok(Arc::new(MissOutcome {
             bytes: Bytes::from(output.bytes),
