@@ -19,6 +19,13 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.title="Murklet" \
+      org.opencontainers.image.description="Image proxy and on-demand image transformation service written in Rust." \
+      org.opencontainers.image.url="https://github.com/guttenbergovitz/murklet" \
+      org.opencontainers.image.source="https://github.com/guttenbergovitz/murklet" \
+      org.opencontainers.image.documentation="https://github.com/guttenbergovitz/murklet/blob/main/docs/operations.md" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -28,6 +35,7 @@ WORKDIR /app
 
 COPY --from=builder /src/target/release/murklet /usr/local/bin/murklet
 COPY --from=builder /src/murklet.example.toml /app/murklet.toml
+COPY LICENSE-MIT LICENSE-APACHE /usr/share/doc/murklet/
 
 # The example binds to loopback, which is unreachable through a published container port.
 RUN sed -i 's|127\.0\.0\.1:9876|0.0.0.0:9876|' /app/murklet.toml \

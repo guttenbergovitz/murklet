@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Dual licence (`LICENSE-MIT`, `LICENSE-APACHE`, `Cargo.toml`, `README.md`):** Murklet is now dual-licensed under `MIT OR Apache-2.0`.
+- **Docker Hub release pipeline (`.github/workflows/docker-publish.yml`, `Dockerfile`, `.dockerignore`):** Automated multi-arch (`linux/amd64`, `linux/arm64`) Docker Hub builds on `v*.*.*` tags with SemVer tagging, OCI labels, BuildKit provenance/SBOM attestations, bundled licence files, and automatic Docker Hub description sync.
 - **Operations guide (`docs/operations.md`) and documentation index (`docs/README.md`):** Container usage, `503` reasons mapped to the limit to tune, memory sizing, cache and purge contract, and a metrics reference.
 - **Reproducible live benchmark harness (`scripts/bench/live_pressure.py`, `task bench:live`):** The RSS/CPU/latency measurements in `docs/benchmarks.md` can now be regenerated from the repository (`standard` and `heavy` profiles).
 - **Example policy test suite (`policy-tests.example.toml`):** Replaces a README reference to a file that did not exist.
