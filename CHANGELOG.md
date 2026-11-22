@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-11-22
+
+### Fixed
+
+- **Linearisable cache invalidation against in-flight writes (`src/cache/invalidation.rs`, `src/http/router.rs`):** Added an RAII `InvalidationTracker` (`FlightToken` + shared/exclusive I/O gate) so `POST /cache/purge` and `POST /cache/cleanup` advance per-source or global generation epochs and prevent concurrent in-flight fetch/transform requests from repopulating stale variant or raw-source entries on disk after invalidation.
+
 ## [0.7.0] - 2026-11-22
 
 ### Added

@@ -16,7 +16,9 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
-use crate::cache::{CacheKey, Coalescer, FsCache, compute_etag, source_digest_hex};
+use crate::cache::{
+    CacheKey, Coalescer, FlightToken, FsCache, InvalidationTracker, compute_etag, source_digest_hex,
+};
 use crate::domain::{
     DEFAULT_MAX_DIMENSION, ImageDimensions, OutputFormat, SelectedFilter, TransformSpec,
 };
@@ -102,6 +104,7 @@ pub struct AppState {
     pub diagnostic_headers: bool,
     coalescer: VariantCoalescer,
     source_coalescer: SourceCoalescer,
+    invalidation: InvalidationTracker,
     transform_permits: Arc<Semaphore>,
     fetch_permits: Arc<Semaphore>,
     pending_transform_permits: Arc<Semaphore>,
@@ -138,6 +141,7 @@ impl AppState {
             diagnostic_headers: false,
             coalescer: Coalescer::new(),
             source_coalescer: Coalescer::new(),
+            invalidation: InvalidationTracker::new(),
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
             fetch_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FETCHES)),
             pending_transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_TRANSFORMS)),
@@ -602,7 +606,12 @@ async fn fetch_transform_and_cache(
             retry_after_secs: 2,
         })?;
 
-    let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source).await?;
+    // Capture the source's invalidation epoch before fetching so a concurrent
+    // `POST /cache/purge` or `POST /cache/cleanup` prevents stale writes to disk.
+    let source_digest = source_digest_hex(origin_id, &source);
+    let flight = Arc::new(state.invalidation.begin_flight(source_digest));
+
+    let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source, &flight).await?;
     let original_size = source_bytes.len();
 
     // Account for raw source bytes held in memory until transformation drops them.
@@ -658,15 +667,25 @@ async fn fetch_transform_and_cache(
             CacheKey::from_parts(origin_id, &source, &effective_spec)
         };
 
-        let etag = match state.cache.put(&effective_key, &output.bytes) {
-            Ok(stored) => stored.etag,
-            Err(err) => {
+        let etag = match state
+            .invalidation
+            .write_if_current(&flight, || state.cache.put(&effective_key, &output.bytes))
+        {
+            Some(Ok(stored)) => stored.etag,
+            Some(Err(err)) => {
                 metrics.record_cache_error(CacheTier::Variant, CacheOp::Write);
                 tracing::warn!(
                     cache = "variant",
                     op = "write",
                     error = %err,
                     "variant cache write failed; serving uncached response"
+                );
+                compute_etag(&output.bytes)
+            }
+            None => {
+                tracing::debug!(
+                    origin = origin_id,
+                    "skipping variant cache write for invalidated in-flight request"
                 );
                 compute_etag(&output.bytes)
             }
@@ -695,6 +714,7 @@ async fn fetch_source_bytes(
     origin_id: &'static str,
     origin_kind: OriginKind,
     source: &str,
+    flight: &Arc<FlightToken>,
 ) -> Result<Bytes, HttpError> {
     if origin_kind == OriginKind::Local {
         let _fetch_permit = acquire_fetch_permit(state).await?;
@@ -720,6 +740,7 @@ async fn fetch_source_bytes(
             let state = Arc::clone(state);
             let source_owned = source.to_owned();
             let digest_for_put = digest.clone();
+            let flight_for_put = Arc::clone(flight);
             async move {
                 let fetch_permit = acquire_fetch_permit(&state).await?;
                 let fetched = match origin_kind {
@@ -740,7 +761,7 @@ async fn fetch_source_bytes(
                 drop(fetch_permit);
 
                 let bytes = Bytes::from(fetched.bytes);
-                store_source_cache(&state, digest_for_put, bytes.clone()).await;
+                store_source_cache(&state, digest_for_put, bytes.clone(), flight_for_put).await;
                 Ok(bytes)
             }
         })
@@ -796,13 +817,26 @@ async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
     }
 }
 
-async fn store_source_cache(state: &AppState, digest: String, bytes: Bytes) {
+async fn store_source_cache(
+    state: &AppState,
+    digest: String,
+    bytes: Bytes,
+    flight: Arc<FlightToken>,
+) {
     let Some(source_cache) = state.source_cache.clone() else {
         return;
     };
-    match tokio::task::spawn_blocking(move || source_cache.put_raw(&digest, &bytes)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
+    let invalidation = state.invalidation.clone();
+    match tokio::task::spawn_blocking(move || {
+        invalidation.write_if_current(&flight, || source_cache.put_raw(&digest, &bytes))
+    })
+    .await
+    {
+        Ok(Some(Ok(()))) => {}
+        Ok(None) => {
+            tracing::debug!("skipping source cache write for invalidated in-flight request");
+        }
+        Ok(Some(Err(err))) => {
             state
                 .metrics
                 .record_cache_error(CacheTier::Source, CacheOp::Write);
@@ -877,14 +911,17 @@ async fn purge_source_entries(state: &Arc<AppState>, source_url: &str) -> Result
 
     let cache = state.cache.clone();
     let source_cache = state.source_cache.clone();
+    let invalidation = state.invalidation.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
-        let mut count = cache.purge_source(&digest)?;
-        if let Some(src_cache) = source_cache
-            && src_cache.delete_raw(&digest)?
-        {
-            count += 1;
-        }
-        Ok(count)
+        invalidation.run_source_purge(&digest, || {
+            let mut count = cache.purge_source(&digest)?;
+            if let Some(src_cache) = source_cache
+                && src_cache.delete_raw(&digest)?
+            {
+                count += 1;
+            }
+            Ok(count)
+        })
     })
     .await
     .map_err(|_| HttpError::Internal)??;
@@ -937,12 +974,15 @@ async fn cleanup_handler(
 
     let cache = state.cache.clone();
     let source_cache = state.source_cache.clone();
+    let invalidation = state.invalidation.clone();
     let removed = tokio::task::spawn_blocking(move || -> Result<u64, crate::cache::CacheError> {
-        let mut count = cache.cleanup()?;
-        if let Some(src_cache) = source_cache {
-            count += src_cache.cleanup()?;
-        }
-        Ok(count)
+        invalidation.run_full_cleanup(|| {
+            let mut count = cache.cleanup()?;
+            if let Some(src_cache) = source_cache {
+                count += src_cache.cleanup()?;
+            }
+            Ok(count)
+        })
     })
     .await
     .map_err(|_| HttpError::Internal)??;
@@ -2004,5 +2044,88 @@ mod tests {
             .unwrap();
         assert_eq!(byte_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(byte_resp.headers().get("retry-after").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn purge_during_in_flight_transform_prevents_stale_cache_write() {
+        let fixture = TestFixture::new("purge-race");
+        let mut state = fixture.state().with_max_concurrent_transforms(1);
+        state.cleanup_token = Some("s3cr3t-token".to_owned());
+        state.transform_queue_timeout = Duration::from_secs(5);
+        let state = Arc::new(state);
+        let app = build_router(Arc::clone(&state));
+
+        // Hold the sole transform slot so the in-flight request fetches the old source
+        // bytes and pauses before transforming and writing to cache.
+        let held_transform = Arc::clone(&state.transform_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let in_flight_app = app.clone();
+        let in_flight = tokio::spawn(async move {
+            in_flight_app
+                .oneshot(
+                    Request::builder()
+                        .uri("/load?url=sample.png&w=40&f=jpeg")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        // Wait briefly for the in-flight request to register its FlightToken and pause
+        // on the transform semaphore.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Replace the source image on disk with a visually distinct colour and purge.
+        let updated = RgbaImage::from_pixel(100, 60, Rgba([220, 20, 40, 255]));
+        let mut updated_bytes = Vec::new();
+        DynamicImage::ImageRgba8(updated)
+            .write_to(&mut Cursor::new(&mut updated_bytes), ImageFormat::Png)
+            .unwrap();
+        fs::write(fixture.origin_dir.join("sample.png"), updated_bytes).unwrap();
+
+        let purge_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cache/purge?url=sample.png")
+                    .header("x-cache-cleanup-token", "s3cr3t-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purge_resp.status(), StatusCode::OK);
+
+        // Release the transform slot so the stale in-flight request completes.
+        drop(held_transform);
+        let stale_resp = in_flight.await.unwrap();
+        assert_eq!(stale_resp.status(), StatusCode::OK);
+        let stale_etag = stale_resp
+            .headers()
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // Next request must MISS (stale write was skipped) and serve the updated source.
+        let fresh_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh_resp.status(), StatusCode::OK);
+        assert_eq!(fresh_resp.headers().get("x-cache").unwrap(), "MISS");
+        let fresh_etag = fresh_resp.headers().get(ETAG).unwrap().to_str().unwrap();
+        assert_ne!(fresh_etag, stale_etag);
     }
 }
