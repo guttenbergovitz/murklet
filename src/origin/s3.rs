@@ -288,6 +288,13 @@ impl S3Origin {
         }
 
         drop(streaming_gate);
+        if let Some(expected) = content_length
+            && bytes.len() != expected
+        {
+            return Err(OriginError::Io(
+                "S3 response body was truncated before declared Content-Length".to_owned(),
+            ));
+        }
         if let Some(res) = reservation {
             res.shrink_to(bytes.len());
         }
