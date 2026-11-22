@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] - 2026-11-22
+
+### Added
+
+- **Architecture decision record (`docs/adr/0004-resource-isolation-and-invalidation-semantics.md`):** Documented the four-stage backpressure model (`max_pending_transforms`, `max_concurrent_fetches`, `max_in_flight_source_bytes`, `max_concurrent_transforms`), linearisable in-memory invalidation epochs (`InvalidationTracker`) including their single-instance scope, and cache-error observability guarantees.
+
 ## [0.8.2] - 2026-11-22
 
 ### Added
