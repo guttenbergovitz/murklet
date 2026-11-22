@@ -18,7 +18,9 @@ use crate::http::error::HttpError;
 use crate::http::metrics::{BackpressureReason, CacheOp, CacheTier, Metrics, OriginKind};
 use crate::http::negotiate::negotiate_format_allowed;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
-use crate::origin::{HttpOrigin, LocalFsOrigin, S3Origin};
+use crate::origin::{
+    ByteBudget, ByteReservation, HttpOrigin, LocalFsOrigin, OriginError, S3Origin,
+};
 use crate::policy::{
     DEFAULT_CACHE_CONTROL, DEFAULT_MAX_CONCURRENT_FETCHES, DEFAULT_MAX_CONCURRENT_TRANSFORMS,
     DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES, DEFAULT_MAX_PENDING_TRANSFORMS,
@@ -30,10 +32,13 @@ pub(crate) const LOCAL_ORIGIN_ID: &str = "local";
 const HTTP_ORIGIN_ID: &str = "http";
 const S3_ORIGIN_ID: &str = "s3";
 
-/// Converts a byte count into 1 KiB semaphore permit units (rounded up, minimum 1).
-fn bytes_to_kib_permits(bytes: usize) -> u32 {
-    let kib = bytes.div_ceil(1024).max(1);
-    u32::try_from(kib.min(Semaphore::MAX_PERMITS)).unwrap_or(u32::MAX)
+/// Raw source bytes paired with their RAII [`ByteReservation`] so memory permits
+/// and `murklet_in_flight_source_bytes` stay accounted for from pre-allocation
+/// until the last coalesced consumer finishes transforming.
+#[derive(Debug)]
+struct ReservedSource {
+    bytes: Bytes,
+    _reservation: ByteReservation,
 }
 
 /// Shared output of a cache-miss fetch and transformation, holding refcounted
@@ -89,7 +94,7 @@ pub struct ResolvedLoad {
 }
 
 type VariantCoalescer = Coalescer<CacheKey, Result<Arc<MissOutcome>, HttpError>>;
-type SourceCoalescer = Coalescer<String, Result<Bytes, HttpError>>;
+type SourceCoalescer = Coalescer<String, Result<Arc<ReservedSource>, HttpError>>;
 
 /// Shared immutable application state injected into HTTP handlers.
 #[derive(Debug, Clone)]
@@ -136,7 +141,7 @@ pub struct AppState {
     pub(crate) fetch_permits: Arc<Semaphore>,
     pub(crate) pending_transform_permits: Arc<Semaphore>,
     pub(crate) in_flight_byte_permits: Arc<Semaphore>,
-    in_flight_source_budget_kib: u32,
+    source_byte_budget: ByteBudget,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -148,6 +153,12 @@ impl AppState {
         http_origin: Option<HttpOrigin>,
         cache: FsCache,
     ) -> Self {
+        let metrics = Arc::new(Metrics::new());
+        let source_byte_budget = ByteBudget::new(
+            DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES,
+            metrics.in_flight_source_bytes_counter(),
+        );
+        let in_flight_byte_permits = source_byte_budget.semaphore();
         Self {
             local_origin,
             http_origin,
@@ -172,11 +183,9 @@ impl AppState {
             transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TRANSFORMS)),
             fetch_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FETCHES)),
             pending_transform_permits: Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_TRANSFORMS)),
-            in_flight_byte_permits: Arc::new(Semaphore::new(bytes_to_kib_permits(
-                DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES,
-            ) as usize)),
-            in_flight_source_budget_kib: bytes_to_kib_permits(DEFAULT_MAX_IN_FLIGHT_SOURCE_BYTES),
-            metrics: Arc::new(Metrics::new()),
+            in_flight_byte_permits,
+            source_byte_budget,
+            metrics,
         }
     }
 
@@ -232,9 +241,9 @@ impl AppState {
     /// Sets the aggregate raw source byte budget held in memory across in-flight requests.
     #[must_use]
     pub fn with_max_in_flight_source_bytes(mut self, max_bytes: usize) -> Self {
-        let budget_kib = bytes_to_kib_permits(max_bytes);
-        self.in_flight_byte_permits = Arc::new(Semaphore::new(budget_kib as usize));
-        self.in_flight_source_budget_kib = budget_kib;
+        let budget = ByteBudget::new(max_bytes, self.metrics.in_flight_source_bytes_counter());
+        self.in_flight_byte_permits = budget.semaphore();
+        self.source_byte_budget = budget;
         self
     }
 
@@ -526,11 +535,9 @@ async fn fetch_transform_and_cache(
     spec: TransformSpec,
     key: CacheKey,
 ) -> Result<Arc<MissOutcome>, HttpError> {
-    let started = Instant::now();
-
     // Shed excess cache-miss load immediately before touching any origin so the
     // queue waiting for CPU transform slots stays strictly bounded.
-    let _pending_permit = Arc::clone(&state.pending_transform_permits)
+    let pending_permit = Arc::clone(&state.pending_transform_permits)
         .try_acquire_owned()
         .map_err(|_| reject_backpressure(&state, BackpressureReason::PendingQueue))?;
 
@@ -539,46 +546,46 @@ async fn fetch_transform_and_cache(
     let source_digest = source_digest_hex(origin_id, &source);
     let flight = Arc::new(state.invalidation.begin_flight(source_digest));
 
-    let source_bytes = fetch_source_bytes(&state, origin_id, origin_kind, &source, &flight).await?;
-    let original_size = source_bytes.len();
-
-    // Account for raw source bytes held in memory until transformation drops them.
-    let source_kib = bytes_to_kib_permits(original_size);
-    if source_kib > state.in_flight_source_budget_kib {
-        return Err(reject_backpressure(&state, BackpressureReason::ByteBudget));
-    }
-    let _byte_permit = tokio::time::timeout(
-        state.transform_queue_timeout,
-        Arc::clone(&state.in_flight_byte_permits).acquire_many_owned(source_kib),
-    )
-    .await
-    .map_err(|_| reject_backpressure(&state, BackpressureReason::ByteBudget))?
-    .map_err(|_| HttpError::Internal)?;
-    let _in_flight_bytes = state.metrics.track_in_flight_source_bytes(original_size);
+    // Reserve raw source memory incrementally *before* allocating buffers or
+    // appending streamed chunks from any origin.
+    let reserved_source =
+        fetch_source_bytes(&state, origin_id, origin_kind, &source, &flight).await?;
+    let original_size = reserved_source.bytes.len();
 
     // Bound concurrent CPU/memory-intensive image decoding and encoding, failing fast
     // with 503 Retry-After when the queue stays saturated past `transform_queue_timeout`.
-    let _permit = tokio::time::timeout(
+    let transform_permit = tokio::time::timeout(
         state.transform_queue_timeout,
         Arc::clone(&state.transform_permits).acquire_owned(),
     )
     .await
     .map_err(|_| reject_backpressure(&state, BackpressureReason::TransformTimeout))?
     .map_err(|_| HttpError::Internal)?;
-    let _in_flight = state.metrics.track_in_flight();
+    let in_flight_transform = state.metrics.track_in_flight();
 
     let metrics = Arc::clone(&state.metrics);
+    // Move all permits, byte reservations, and RAII gauges into the blocking task so
+    // client cancellation cannot release concurrency or memory slots while CPU work runs.
     tokio::task::spawn_blocking(move || -> Result<Arc<MissOutcome>, HttpError> {
+        let _pending_permit = pending_permit;
+        let _transform_permit = transform_permit;
+        let _in_flight_transform = in_flight_transform;
+
         let watermark = spec
             .watermark
             .as_ref()
             .and_then(|wm| state.watermarks.get(&wm.name));
+        let transform_started = Instant::now();
         let output = engine::transform_with_watermark(
-            &source_bytes,
+            &reserved_source.bytes,
             &spec,
             &state.engine_limits,
             watermark.as_deref(),
         )?;
+        let transform_elapsed = transform_started.elapsed();
+
+        // Release raw source bytes and their memory reservation as soon as transformation finishes.
+        drop(reserved_source);
 
         // Store transformed bytes under a key matching the actual output format
         // (relevant if an animated source was passed through in its original format).
@@ -614,7 +621,7 @@ async fn fetch_transform_and_cache(
             }
         };
 
-        metrics.record_transform(origin_kind, output.format, started.elapsed());
+        metrics.record_transform(origin_kind, output.format, transform_elapsed);
 
         Ok(Arc::new(MissOutcome {
             bytes: Bytes::from(output.bytes),
@@ -630,32 +637,63 @@ async fn fetch_transform_and_cache(
     .map_err(|_| HttpError::Internal)?
 }
 
-/// Fetches raw source bytes, coalescing concurrent remote fetches and consulting
-/// the optional disk-backed `source_cache` for HTTP(S) and S3 origins.
+fn map_origin_fetch_error(state: &AppState, err: OriginError) -> HttpError {
+    if matches!(err, OriginError::BudgetExhausted) {
+        return reject_backpressure(state, BackpressureReason::ByteBudget);
+    }
+    HttpError::from(err)
+}
+
+/// Fetches raw source bytes while reserving memory against `source_byte_budget`
+/// before allocation, coalescing concurrent remote fetches and consulting the
+/// optional disk-backed `source_cache` for HTTP(S) and S3 origins.
 async fn fetch_source_bytes(
     state: &Arc<AppState>,
     origin_id: &'static str,
     origin_kind: OriginKind,
     source: &str,
     flight: &Arc<FlightToken>,
-) -> Result<Bytes, HttpError> {
+) -> Result<Arc<ReservedSource>, HttpError> {
     if origin_kind == OriginKind::Local {
-        let _fetch_permit = acquire_fetch_permit(state).await?;
-        let _fetch_guard = state.metrics.track_in_flight_fetch();
+        let fetch_permit = acquire_fetch_permit(state).await?;
+        let fetch_guard = state.metrics.track_in_flight_fetch();
         let local_origin = state.local_origin.clone().ok_or_else(|| {
             HttpError::Forbidden("local filesystem origin is disabled".to_owned())
         })?;
         let source_for_fs = source.to_owned();
-        let fetched = tokio::task::spawn_blocking(move || local_origin.fetch(&source_for_fs))
-            .await
-            .map_err(|_| HttpError::Internal)??;
-        return Ok(Bytes::from(fetched.bytes));
+        let mut reservation = state
+            .source_byte_budget
+            .begin(state.transform_queue_timeout);
+        let (fetched, reservation) = tokio::task::spawn_blocking(move || {
+            let _fetch_permit = fetch_permit;
+            let _fetch_guard = fetch_guard;
+            let fetched = local_origin.fetch_with_budget(&source_for_fs, &mut reservation)?;
+            Ok::<_, OriginError>((fetched, reservation))
+        })
+        .await
+        .map_err(|_| HttpError::Internal)?
+        .map_err(|err| map_origin_fetch_error(state, err))?;
+
+        return Ok(Arc::new(ReservedSource {
+            bytes: Bytes::from(fetched.bytes),
+            _reservation: reservation,
+        }));
     }
 
     let digest = source_digest_hex(origin_id, source);
 
     if let Some(cached) = lookup_source_cache(state, &digest).await {
-        return Ok(cached);
+        let mut reservation = state
+            .source_byte_budget
+            .begin(state.transform_queue_timeout);
+        reservation
+            .reserve_total(cached.len())
+            .await
+            .map_err(|err| map_origin_fetch_error(state, err))?;
+        return Ok(Arc::new(ReservedSource {
+            bytes: cached,
+            _reservation: reservation,
+        }));
     }
 
     let coalesced = state
@@ -668,18 +706,27 @@ async fn fetch_source_bytes(
             async move {
                 let fetch_permit = acquire_fetch_permit(&state).await?;
                 let fetch_guard = state.metrics.track_in_flight_fetch();
+                let mut reservation = state
+                    .source_byte_budget
+                    .begin(state.transform_queue_timeout);
                 let fetched = match origin_kind {
                     OriginKind::Http => {
                         let http_origin = state.http_origin.as_ref().ok_or_else(|| {
                             HttpError::Forbidden("remote HTTP(S) origins are disabled".to_owned())
                         })?;
-                        http_origin.fetch(&source_owned).await?
+                        http_origin
+                            .fetch_with_budget(&source_owned, &mut reservation)
+                            .await
+                            .map_err(|err| map_origin_fetch_error(&state, err))?
                     }
                     OriginKind::S3 => {
                         let s3_origin = state.s3_origin.as_ref().ok_or_else(|| {
                             HttpError::Forbidden("S3 origin is disabled".to_owned())
                         })?;
-                        s3_origin.fetch(&source_owned).await?
+                        s3_origin
+                            .fetch_with_budget(&source_owned, &mut reservation)
+                            .await
+                            .map_err(|err| map_origin_fetch_error(&state, err))?
                     }
                     OriginKind::Local => return Err(HttpError::Internal),
                 };
@@ -688,7 +735,10 @@ async fn fetch_source_bytes(
 
                 let bytes = Bytes::from(fetched.bytes);
                 store_source_cache(&state, digest_for_put, bytes.clone(), flight_for_put).await;
-                Ok(bytes)
+                Ok(Arc::new(ReservedSource {
+                    bytes,
+                    _reservation: reservation,
+                }))
             }
         })
         .await;

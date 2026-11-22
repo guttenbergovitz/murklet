@@ -1451,4 +1451,79 @@ mod tests {
         let fresh_etag = fresh_resp.headers().get(ETAG).unwrap().to_str().unwrap();
         assert_ne!(fresh_etag, stale_etag);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_request_mid_transform_keeps_permits_held_until_blocking_work_finishes() {
+        let fixture = TestFixture::new("cancel-transform");
+        // Write a 160x120 image so debug-mode AVIF encoding takes ~0.5-1.5s of CPU time.
+        let large = RgbaImage::from_fn(160, 120, |x, y| {
+            let r = u8::try_from((x * 7 + y * 3) % 256).unwrap();
+            let g = u8::try_from((x * 5 + y * 11) % 256).unwrap();
+            let b = u8::try_from((x * 13 + y * 17) % 256).unwrap();
+            Rgba([r, g, b, 255])
+        });
+        let mut large_bytes = Vec::new();
+        DynamicImage::ImageRgba8(large)
+            .write_to(&mut Cursor::new(&mut large_bytes), ImageFormat::Png)
+            .unwrap();
+        fs::write(fixture.origin_dir.join("heavy.png"), large_bytes).unwrap();
+
+        let state = Arc::new(fixture.state().with_max_concurrent_transforms(1));
+        let app = build_router(Arc::clone(&state));
+
+        let req_task = tokio::spawn(async move {
+            let _ = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/load?url=heavy.png&w=120&f=avif&q=80")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+        });
+
+        // Wait until the request enters `spawn_blocking` and acquires the sole transform permit.
+        let entered = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.transform_permits.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            entered.is_ok(),
+            "transform task never acquired transform_permits"
+        );
+
+        // Simulate client disconnect by aborting the HTTP request task mid-encode.
+        req_task.abort();
+        let _ = req_task.await;
+
+        // Immediately after cancellation, the blocking AVIF encode is still running and
+        // MUST still hold the transform permit and in-flight gauge.
+        assert_eq!(state.transform_permits.available_permits(), 0);
+        assert!(
+            state
+                .metrics
+                .render_prometheus()
+                .contains("murklet_in_flight_transforms 1\n")
+        );
+
+        // Once the blocking encode finishes, permit and gauge return cleanly to idle.
+        let released = tokio::time::timeout(Duration::from_secs(10), async {
+            while state.transform_permits.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "transform permit was not released after blocking work finished"
+        );
+        assert!(
+            state
+                .metrics
+                .render_prometheus()
+                .contains("murklet_in_flight_transforms 0\n")
+        );
+    }
 }

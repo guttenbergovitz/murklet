@@ -334,3 +334,83 @@ async fn continuous_purge_under_concurrent_load_never_resurrects_stale_variant()
     let final_etag = after_purge.headers().get(ETAG).unwrap().to_str().unwrap();
     assert_ne!(final_etag, initial_etag);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_cancellation_and_overload_leaks_zero_permits_or_gauges() {
+    let fixture = StressFixture::new("cancel-overload");
+    for idx in 0..12 {
+        fixture.write_png(
+            &format!("asset-{idx:02}.png"),
+            200,
+            150,
+            [u8::try_from((idx * 19) % 256).unwrap(), 110, 180, 255],
+        );
+    }
+
+    let mut state = fixture
+        .state()
+        .with_max_concurrent_transforms(2)
+        .with_max_concurrent_fetches(4)
+        .with_max_pending_transforms(6)
+        .with_max_in_flight_source_bytes(256 * 1024);
+    state.transform_queue_timeout = Duration::from_millis(200);
+    let app = build_router(Arc::new(state));
+
+    let mut tasks = Vec::new();
+    for idx in 0..12 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(format!("/load?url=asset-{idx:02}.png&w=96&f=webp"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }));
+    }
+
+    // Abort half of the requests mid-flight to simulate abrupt client disconnects.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for (idx, handle) in tasks.iter().enumerate() {
+        if idx % 2 == 0 {
+            handle.abort();
+        }
+    }
+
+    for (idx, handle) in tasks.into_iter().enumerate() {
+        if idx % 2 == 0 {
+            let _ = handle.await;
+        } else {
+            let resp = handle.await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    resp.status(),
+                    StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+                ),
+                "unexpected status: {}",
+                resp.status()
+            );
+        }
+    }
+
+    // Wait briefly for any detached `spawn_blocking` tasks from aborted requests to finish.
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let m = scrape_metrics(&app).await;
+            if m.contains("murklet_in_flight_transforms 0\n")
+                && m.contains("murklet_in_flight_fetches 0\n")
+                && m.contains("murklet_in_flight_source_bytes 0\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "in-flight gauges failed to return to 0 after mixed cancellations:\n{}",
+        scrape_metrics(&app).await
+    );
+}

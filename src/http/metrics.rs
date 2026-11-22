@@ -257,7 +257,7 @@ pub struct Metrics {
     transforms: [[AtomicU64; 5]; 3],
     in_flight_transforms: AtomicUsize,
     in_flight_fetches: AtomicUsize,
-    in_flight_source_bytes: AtomicUsize,
+    in_flight_source_bytes: Arc<AtomicUsize>,
     transform_buckets: [AtomicU64; 10],
     transform_count: AtomicU64,
     transform_sum_micros: AtomicU64,
@@ -355,6 +355,13 @@ impl Metrics {
         }
     }
 
+    /// Returns a shared handle to the live `murklet_in_flight_source_bytes` gauge
+    /// so streaming origin budgets can update it directly before allocation.
+    #[must_use]
+    pub fn in_flight_source_bytes_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.in_flight_source_bytes)
+    }
+
     /// Adds `bytes` to `murklet_in_flight_source_bytes` and returns an RAII guard
     /// that subtracts `bytes` when dropped.
     #[must_use]
@@ -441,7 +448,7 @@ impl Metrics {
         let sum_secs_whole = sum_micros / 1_000_000;
         let sum_secs_frac = sum_micros % 1_000_000;
 
-        out.push_str("# HELP murklet_transform_duration_seconds Duration of image fetch, transform, and cache write in seconds.\n");
+        out.push_str("# HELP murklet_transform_duration_seconds Duration of CPU-bound image decoding, transformation, and encoding in seconds.\n");
         out.push_str("# TYPE murklet_transform_duration_seconds histogram\n");
         for (idx, label) in DURATION_BUCKET_LABELS.iter().enumerate() {
             let bucket_count = self.transform_buckets[idx].load(Ordering::Relaxed);

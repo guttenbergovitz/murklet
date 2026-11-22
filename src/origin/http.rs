@@ -12,6 +12,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 
+use crate::origin::budget::ByteReservation;
 use crate::origin::error::OriginError;
 use crate::origin::local::FetchedImage;
 use crate::origin::ssrf::{HostAllowlist, is_forbidden_ip, validate_remote_url};
@@ -157,6 +158,29 @@ impl HttpOrigin {
     /// Returns a typed [`OriginError`] on policy violation, SSRF rejection, redirect limit,
     /// upstream non-200 status, timeout, or oversized response body.
     pub async fn fetch(&self, raw_url: &str) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_url, None).await
+    }
+
+    /// Fetches image bytes from `raw_url` while reserving memory against `reservation`
+    /// *before* pre-allocating `Content-Length` or appending each streamed chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::BudgetExhausted`] when the aggregate in-flight source memory
+    /// budget is exhausted, or another [`OriginError`] on policy/SSRF/transport failure.
+    pub async fn fetch_with_budget(
+        &self,
+        raw_url: &str,
+        reservation: &mut ByteReservation,
+    ) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(raw_url, Some(reservation)).await
+    }
+
+    async fn fetch_inner(
+        &self,
+        raw_url: &str,
+        mut reservation: Option<&mut ByteReservation>,
+    ) -> Result<FetchedImage, OriginError> {
         let mut current_url = validate_remote_url(raw_url, &self.allowlist, self.enforce_ip_block)?;
         let mut redirects_followed: u8 = 0;
 
@@ -216,6 +240,11 @@ impl HttpOrigin {
                 .and_then(|len| usize::try_from(len).ok())
                 .unwrap_or(0)
                 .min(self.max_bytes);
+            if initial_cap > 0
+                && let Some(res) = reservation.as_deref_mut()
+            {
+                res.reserve_total(initial_cap).await?;
+            }
             let mut bytes = Vec::with_capacity(initial_cap);
 
             while let Some(chunk) = response
@@ -229,6 +258,9 @@ impl HttpOrigin {
                         size: new_len,
                         max: self.max_bytes,
                     });
+                }
+                if let Some(res) = reservation.as_deref_mut() {
+                    res.reserve_total(new_len).await?;
                 }
                 bytes.extend_from_slice(&chunk);
             }
@@ -364,5 +396,54 @@ mod tests {
             origin.fetch(&format!("http://{addr}/loop")).await,
             Err(OriginError::TooManyRedirects { max: 2 })
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_budget_aborts_streaming_http_response_before_buffering_over_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        // Raw chunked HTTP/1.1 server with no Content-Length streaming 8 KiB in 2 KiB chunks.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut req_buf).await;
+                let headers =
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                if socket.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk_payload = vec![b'A'; 2048];
+                for _ in 0..4 {
+                    let header = format!("{:x}\r\n", chunk_payload.len());
+                    if socket.write_all(header.as_bytes()).await.is_err()
+                        || socket.write_all(&chunk_payload).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+
+        let origin = local_test_origin(64 * 1024, 2);
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        // Tight 4 KiB budget: 8 KiB chunked stream must abort mid-stream with BudgetExhausted.
+        let budget = crate::origin::ByteBudget::new(4096, Arc::clone(&live_bytes));
+        let mut reservation = budget.begin(Duration::from_millis(50));
+
+        let err = origin
+            .fetch_with_budget(&format!("http://{addr}/stream.bin"), &mut reservation)
+            .await
+            .unwrap_err();
+        assert_eq!(err, OriginError::BudgetExhausted);
+
+        drop(reservation);
+        assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 4);
     }
 }

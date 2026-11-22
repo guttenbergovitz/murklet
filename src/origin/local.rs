@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+use crate::origin::budget::ByteReservation;
 use crate::origin::error::OriginError;
 
 /// Raw source image payload fetched from an origin adapter.
@@ -68,6 +69,29 @@ impl LocalFsOrigin {
     ///
     /// Returns an [`OriginError`] without exposing internal host filesystem paths.
     pub fn fetch(&self, relative_path: &str) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(relative_path, None)
+    }
+
+    /// Fetches a regular file under `self.root` while reserving memory against `reservation`
+    /// *before* allocating the payload buffer or extending it on concurrent file growth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::BudgetExhausted`] if the byte budget cannot be reserved,
+    /// or another [`OriginError`] on path/file validation failure.
+    pub fn fetch_with_budget(
+        &self,
+        relative_path: &str,
+        reservation: &mut ByteReservation,
+    ) -> Result<FetchedImage, OriginError> {
+        self.fetch_inner(relative_path, Some(reservation))
+    }
+
+    fn fetch_inner(
+        &self,
+        relative_path: &str,
+        mut reservation: Option<&mut ByteReservation>,
+    ) -> Result<FetchedImage, OriginError> {
         let candidate = self.resolve_candidate(relative_path)?;
 
         let canonical_target = fs::canonicalize(&candidate).map_err(|err| match err.kind() {
@@ -79,7 +103,7 @@ impl LocalFsOrigin {
             return Err(OriginError::PathEscapesRoot);
         }
 
-        let file = File::open(&canonical_target).map_err(|err| match err.kind() {
+        let mut file = File::open(&canonical_target).map_err(|err| match err.kind() {
             io::ErrorKind::NotFound => OriginError::NotFound,
             kind => OriginError::Io(kind.to_string()),
         })?;
@@ -102,26 +126,33 @@ impl LocalFsOrigin {
             });
         }
 
-        // Stream with a strict cap of `max_bytes + 1` so concurrent file growth
-        // cannot trigger unbounded heap allocation.
-        let read_limit = u64::try_from(self.max_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-
         let initial_cap = usize::try_from(metadata.len())
             .unwrap_or(0)
             .min(self.max_bytes);
+        if let Some(res) = reservation.as_deref_mut() {
+            res.reserve_total_blocking(initial_cap)?;
+        }
+
         let mut bytes = Vec::with_capacity(initial_cap);
-
-        file.take(read_limit)
-            .read_to_end(&mut bytes)
-            .map_err(|err| OriginError::Io(err.kind().to_string()))?;
-
-        if bytes.len() > self.max_bytes {
-            return Err(OriginError::PayloadTooLarge {
-                size: bytes.len(),
-                max: self.max_bytes,
-            });
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|err| OriginError::Io(err.kind().to_string()))?;
+            if read == 0 {
+                break;
+            }
+            let new_len = bytes.len().saturating_add(read);
+            if new_len > self.max_bytes {
+                return Err(OriginError::PayloadTooLarge {
+                    size: new_len,
+                    max: self.max_bytes,
+                });
+            }
+            if let Some(res) = reservation.as_deref_mut() {
+                res.reserve_total_blocking(new_len)?;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
         }
 
         Ok(FetchedImage { bytes })
