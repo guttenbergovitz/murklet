@@ -4,6 +4,28 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] - 2026-11-22
+
+### Added
+
+- **Singleflight cancellation + purge interaction tests (`src/cache/coalesce.rs`, `src/http/router.rs`):** Added deterministic tests verifying that aborting a singleflight leader hands leadership cleanly to a waiting follower, that a concurrent `POST /cache/purge` prevents pre-purge flights from writing stale entries to disk, and that all permits and in-flight gauges return to zero.
+
+### Changed
+
+- **Clarified source byte budget vs process RSS (`docs/adr/0004-resource-isolation-and-invalidation-semantics.md`, `murklet.example.toml`, `README.md`):** Documented explicitly that `limits.max_in_flight_source_bytes` bounds raw in-flight source payloads only (not total process RSS), while decoded pixel and transform working memory is bounded separately by `max_concurrent_transforms`, `max_decoded_pixels`, and `max_target_dimension`.
+
+## [0.9.3] - 2026-11-22
+
+### Fixed
+
+- **Deadlock-free unknown-length streaming byte budget (`src/origin/budget.rs`, `src/origin/http.rs`, `src/origin/s3.rs`):** Added `ByteReservation::reserve_unknown_length_headroom` and `ByteReservation::shrink_to`. Chunked/unknown-length responses now reserve `max_bytes` atomically upfront and shrink to actual length on completion when `max_bytes` fits within the budget, or serialise incremental growth behind a single streaming gate when the budget is tighter than `max_bytes`, preventing concurrent partial holders from deadlocking until timeout.
+
+## [0.9.2] - 2026-11-22
+
+### Fixed
+
+- **Pre-allocation byte budget on raw source-cache hits (`src/cache/fs.rs`, `src/cache/error.rs`, `src/application/load.rs`):** Added `FsCache::get_raw_with_budget` and `CacheError::BudgetExhausted` so `[cache.source]` hits reserve against `limits.max_in_flight_source_bytes` *before* allocating payload buffers rather than after reading the entire file into memory. Budget exhaustion returns `503 Retry-After` (`reason="byte_budget"`) instead of falling back to origin.
+
 ## [0.9.1] - 2026-11-22
 
 ### Added

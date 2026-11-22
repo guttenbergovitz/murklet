@@ -235,15 +235,19 @@ impl HttpOrigin {
                 });
             }
 
-            let initial_cap = response
+            let content_length = response
                 .content_length()
-                .and_then(|len| usize::try_from(len).ok())
-                .unwrap_or(0)
-                .min(self.max_bytes);
-            if initial_cap > 0
-                && let Some(res) = reservation.as_deref_mut()
-            {
-                res.reserve_total(initial_cap).await?;
+                .and_then(|len| usize::try_from(len).ok());
+            let initial_cap = content_length.unwrap_or(0).min(self.max_bytes);
+            let mut streaming_gate = None;
+            if let Some(res) = reservation.as_deref_mut() {
+                if content_length.is_some() {
+                    if initial_cap > 0 {
+                        res.reserve_total(initial_cap).await?;
+                    }
+                } else {
+                    streaming_gate = res.reserve_unknown_length_headroom(self.max_bytes).await?;
+                }
             }
             let mut bytes = Vec::with_capacity(initial_cap);
 
@@ -263,6 +267,11 @@ impl HttpOrigin {
                     res.reserve_total(new_len).await?;
                 }
                 bytes.extend_from_slice(&chunk);
+            }
+
+            drop(streaming_gate);
+            if let Some(res) = reservation.as_deref_mut() {
+                res.shrink_to(bytes.len());
             }
 
             return Ok(FetchedImage { bytes });
@@ -443,6 +452,68 @@ mod tests {
         assert_eq!(err, OriginError::BudgetExhausted);
 
         drop(reservation);
+        assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_chunked_streams_do_not_deadlock_tight_byte_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        // Spawn a chunked HTTP/1.1 server serving 3 KiB (2 KiB + 1 KiB) with a mid-stream pause.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut req_buf = [0u8; 512];
+                        let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut req_buf).await;
+                        let headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        if socket.write_all(headers.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        for size in [2048usize, 1024usize] {
+                            let chunk = vec![b'B'; size];
+                            let header = format!("{size:x}\r\n");
+                            if socket.write_all(header.as_bytes()).await.is_err()
+                                || socket.write_all(&chunk).await.is_err()
+                                || socket.write_all(b"\r\n").await.is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        let _ = socket.write_all(b"0\r\n\r\n").await;
+                    });
+                }
+            }
+        });
+
+        let origin = Arc::new(local_test_origin(64 * 1024, 2));
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        // Tight 4 KiB budget for two concurrent 3 KiB chunked streams: without deadlock
+        // prevention, each would hold 2 KiB and block waiting for the other until timeout.
+        let budget = crate::origin::ByteBudget::new(4096, Arc::clone(&live_bytes));
+
+        let mut handles = Vec::new();
+        for idx in 0..2 {
+            let origin = Arc::clone(&origin);
+            let budget = budget.clone();
+            handles.push(tokio::spawn(async move {
+                let mut res = budget.begin(Duration::from_millis(500));
+                let fetched = origin
+                    .fetch_with_budget(&format!("http://{addr}/stream-{idx}.bin"), &mut res)
+                    .await?;
+                Ok::<usize, OriginError>(fetched.bytes.len())
+            }));
+        }
+
+        for handle in handles {
+            let len = handle.await.unwrap().unwrap();
+            assert_eq!(len, 3072);
+        }
         assert_eq!(live_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(budget.semaphore().available_permits(), 4);
     }

@@ -27,6 +27,9 @@ pub fn bytes_to_kib_permits(bytes: usize) -> u32 {
 #[derive(Debug, Clone)]
 pub struct ByteBudget {
     permits: Arc<Semaphore>,
+    /// Serialises incremental growth for unknown-length streams when `max_bytes` exceeds
+    /// the total budget so concurrent partial holders cannot deadlock waiting on each other.
+    streaming_gate: Arc<Semaphore>,
     budget_kib: u32,
     live_bytes: Arc<AtomicUsize>,
 }
@@ -39,6 +42,7 @@ impl ByteBudget {
         let budget_kib = bytes_to_kib_permits(max_bytes).max(1);
         Self {
             permits: Arc::new(Semaphore::new(budget_kib as usize)),
+            streaming_gate: Arc::new(Semaphore::new(1)),
             budget_kib,
             live_bytes,
         }
@@ -117,6 +121,65 @@ impl ByteReservation {
             .live_bytes
             .fetch_add(delta_bytes, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Prepares deadlock-free budget accounting for an unknown-length stream (missing
+    /// `Content-Length`) bounded by `max_bytes`.
+    ///
+    /// - When `max_bytes` fits within the total budget (the standard production invariant),
+    ///   reserves `max_bytes` atomically upfront so the stream never blocks mid-body holding
+    ///   partial permits; callers should invoke [`Self::shrink_to`] once the stream finishes.
+    /// - When `max_bytes` exceeds the total budget, acquires the single-slot streaming gate
+    ///   so at most one unknown-length stream grows incrementally at a time, eliminating
+    ///   mutual partial-reservation deadlocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::BudgetExhausted`] if waiting for permits or the streaming gate
+    /// exceeds `self.timeout`.
+    pub async fn reserve_unknown_length_headroom(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Option<OwnedSemaphorePermit>, OriginError> {
+        let max_kib = bytes_to_kib_permits(max_bytes);
+        if max_kib > 0 && max_kib <= self.budget.budget_kib {
+            self.reserve_total(max_bytes).await?;
+            return Ok(None);
+        }
+
+        let gate = tokio::time::timeout(
+            self.timeout,
+            Arc::clone(&self.budget.streaming_gate).acquire_owned(),
+        )
+        .await
+        .map_err(|_| OriginError::BudgetExhausted)?
+        .map_err(|_| OriginError::BudgetExhausted)?;
+        Ok(Some(gate))
+    }
+
+    /// Shrinks an over-reserved allocation down to `actual_bytes`, immediately returning
+    /// unused KiB permits to the shared semaphore and updating the live-bytes gauge.
+    pub fn shrink_to(&mut self, actual_bytes: usize) {
+        if actual_bytes >= self.reserved_bytes {
+            return;
+        }
+
+        let target_kib = bytes_to_kib_permits(actual_bytes);
+        let release_kib = self.reserved_kib.saturating_sub(target_kib);
+        if release_kib > 0 {
+            if target_kib == 0 {
+                self.permit = None;
+            } else if let Some(permit) = &mut self.permit {
+                let _released = permit.split(release_kib as usize);
+            }
+            self.reserved_kib = target_kib;
+        }
+
+        let release_bytes = self.reserved_bytes.saturating_sub(actual_bytes);
+        self.reserved_bytes = actual_bytes;
+        self.budget
+            .live_bytes
+            .fetch_sub(release_bytes, Ordering::Relaxed);
     }
 
     /// Blocking counterpart to [`Self::reserve_total`] for use inside `spawn_blocking`
@@ -199,5 +262,26 @@ mod tests {
         drop(res);
         assert_eq!(live.load(Ordering::Relaxed), 0);
         assert_eq!(budget.semaphore().available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_headroom_reserves_pessimistically_and_shrinks_to_actual() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let budget = ByteBudget::new(8192, Arc::clone(&live));
+        let mut res = budget.begin(Duration::from_millis(50));
+
+        let gate = res.reserve_unknown_length_headroom(6144).await.unwrap();
+        assert!(gate.is_none());
+        assert_eq!(live.load(Ordering::Relaxed), 6144);
+        assert_eq!(budget.semaphore().available_permits(), 2);
+
+        // Shrink down to actual received payload (1500 bytes -> 2 KiB permits).
+        res.shrink_to(1500);
+        assert_eq!(live.load(Ordering::Relaxed), 1500);
+        assert_eq!(budget.semaphore().available_permits(), 6);
+
+        drop(res);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.semaphore().available_permits(), 8);
     }
 }

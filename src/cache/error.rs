@@ -14,6 +14,8 @@ pub enum CacheError {
         /// Configured maximum permitted size per cache entry in bytes.
         max: usize,
     },
+    /// Caller's memory-budget reservation callback rejected allocating the entry.
+    BudgetExhausted,
     /// Unexpected filesystem or storage I/O failure.
     Io(String),
 }
@@ -27,6 +29,9 @@ impl fmt::Display for CacheError {
                     f,
                     "cache entry size {size} bytes exceeds maximum of {max} bytes"
                 )
+            }
+            Self::BudgetExhausted => {
+                f.write_str("in-flight memory budget exhausted before reading cached entry")
             }
             Self::Io(reason) => write!(f, "cache I/O failure: {reason}"),
         }
