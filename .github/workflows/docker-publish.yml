@@ -59,6 +59,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
 
       - name: Build native platform image
         id: build
@@ -139,12 +141,3 @@ jobs:
         run: |
           first_tag="$(head -n 1 <<< "${{ steps.meta.outputs.tags }}")"
           docker buildx imagetools inspect "$first_tag"
-
-      - name: Update Docker Hub repository description
-        uses: peter-evans/dockerhub-description@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ env.IMAGE_NAME }}
-          short-description: "Self-contained Rust image proxy: AVIF/WebP/JPEG/PNG, per-origin policies, and bounded limits."
-          readme-filepath: ./README.md
