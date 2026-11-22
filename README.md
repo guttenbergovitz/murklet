@@ -287,6 +287,7 @@ docker build -t murklet:0.9.5 .
 
 - [Engineering and Git Conventions](docs/conventions.md) — coding standards, Git Flow, SemVer, and commit guidelines.
 - [Architecture Decision Records](docs/adr/README.md) — lightweight record of key technical decisions ([ADR 0001](docs/adr/0001-pure-rust-static-image-engine.md), [ADR 0002](docs/adr/0002-single-crate-module-boundaries.md), [ADR 0003](docs/adr/0003-policy-first-differentiation-and-per-origin-boundaries.md), [ADR 0004](docs/adr/0004-resource-isolation-and-invalidation-semantics.md)).
+- [Empirical Benchmarks & Resource Sizing](docs/benchmarks.md) — measured RSS, CPU, p50/p95/p99 latency, backpressure behaviour, and cache eviction timings.
 - [Example Configuration](murklet.example.toml) — annotated TOML policy reference.
 - [Changelog](CHANGELOG.md) — release history.
 
