@@ -4,6 +4,12 @@ All notable changes to Murklet are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-11-22
+
+### Fixed
+
+- **Cache read and write error observability (`src/http/metrics.rs`, `src/http/router.rs`):** Stopped silently treating filesystem cache read/write errors (`FsCache::get`, `FsCache::put`, `FsCache::get_raw`, `FsCache::put_raw`) as ordinary cache misses. Requests still degrade gracefully to origin, while emitting structured `tracing::warn!` logs and incrementing the low-cardinality Prometheus counter `murklet_cache_errors_total{cache="variant|source",op="read|write"}`.
+
 ## [0.6.0] - 2026-11-21
 
 ### Added

@@ -23,7 +23,7 @@ use crate::domain::{
 use crate::engine::{self, EngineLimits, WatermarkRegistry};
 use crate::http::error::HttpError;
 use crate::http::metrics::{
-    CacheOutcome, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
+    CacheOp, CacheOutcome, CacheTier, Metrics, OriginKind, PROMETHEUS_CONTENT_TYPE, StatusClass,
 };
 use crate::http::negotiate::negotiate_format_allowed;
 use crate::http::query::{RawLoadQuery, parse_load_query_with_presets};
@@ -322,15 +322,7 @@ async fn handle_load_inner(
         .map(str::to_owned);
 
     // Check cache on the blocking pool so disk I/O never stalls async worker threads.
-    let cache_lookup = {
-        let state = Arc::clone(state);
-        let key = cache_key.clone();
-        tokio::task::spawn_blocking(move || state.cache.get(&key))
-            .await
-            .map_err(|_| HttpError::Internal)?
-    };
-
-    if let Ok(Some(cached)) = cache_lookup {
+    if let Some(cached) = lookup_variant_cache(state, &cache_key).await? {
         let response = if etag_matches(if_none_match.as_deref(), &cached.etag) {
             build_not_modified_response(
                 &cached.etag,
@@ -407,6 +399,32 @@ async fn handle_load_inner(
         started,
     );
     Ok(response)
+}
+
+async fn lookup_variant_cache(
+    state: &Arc<AppState>,
+    cache_key: &CacheKey,
+) -> Result<Option<crate::cache::CachedVariant>, HttpError> {
+    let state_for_get = Arc::clone(state);
+    let key = cache_key.clone();
+    match tokio::task::spawn_blocking(move || state_for_get.cache.get(&key))
+        .await
+        .map_err(|_| HttpError::Internal)?
+    {
+        Ok(cached) => Ok(cached),
+        Err(err) => {
+            state
+                .metrics
+                .record_cache_error(CacheTier::Variant, CacheOp::Read);
+            tracing::warn!(
+                cache = "variant",
+                op = "read",
+                error = %err,
+                "variant cache read failed; falling back to origin"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn record_load_success(
@@ -575,7 +593,16 @@ async fn fetch_transform_and_cache(
 
         let etag = match state.cache.put(&effective_key, &output.bytes) {
             Ok(stored) => stored.etag,
-            Err(_) => compute_etag(&output.bytes),
+            Err(err) => {
+                metrics.record_cache_error(CacheTier::Variant, CacheOp::Write);
+                tracing::warn!(
+                    cache = "variant",
+                    op = "write",
+                    error = %err,
+                    "variant cache write failed; serving uncached response"
+                );
+                compute_etag(&output.bytes)
+            }
         };
 
         metrics.record_transform(origin_kind, output.format, started.elapsed());
@@ -615,13 +642,8 @@ async fn fetch_source_bytes(
 
     let digest = source_digest_hex(origin_id, source);
 
-    if let Some(source_cache) = state.source_cache.clone() {
-        let digest_for_get = digest.clone();
-        if let Ok(Ok(Some(cached))) =
-            tokio::task::spawn_blocking(move || source_cache.get_raw(&digest_for_get)).await
-        {
-            return Ok(Bytes::from(cached));
-        }
+    if let Some(cached) = lookup_source_cache(state, &digest).await {
+        return Ok(cached);
     }
 
     let coalesced = state
@@ -648,19 +670,77 @@ async fn fetch_source_bytes(
                 };
 
                 let bytes = Bytes::from(fetched.bytes);
-                if let Some(source_cache) = state.source_cache.clone() {
-                    let bytes_for_put = bytes.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = source_cache.put_raw(&digest_for_put, &bytes_for_put);
-                    })
-                    .await;
-                }
+                store_source_cache(&state, digest_for_put, bytes.clone()).await;
                 Ok(bytes)
             }
         })
         .await;
 
     coalesced.value
+}
+
+async fn lookup_source_cache(state: &AppState, digest: &str) -> Option<Bytes> {
+    let source_cache = state.source_cache.clone()?;
+    let digest_for_get = digest.to_owned();
+    match tokio::task::spawn_blocking(move || source_cache.get_raw(&digest_for_get)).await {
+        Ok(Ok(Some(cached))) => Some(Bytes::from(cached)),
+        Ok(Ok(None)) => None,
+        Ok(Err(err)) => {
+            state
+                .metrics
+                .record_cache_error(CacheTier::Source, CacheOp::Read);
+            tracing::warn!(
+                cache = "source",
+                op = "read",
+                error = %err,
+                "source cache read failed; falling back to origin"
+            );
+            None
+        }
+        Err(err) => {
+            state
+                .metrics
+                .record_cache_error(CacheTier::Source, CacheOp::Read);
+            tracing::warn!(
+                cache = "source",
+                op = "read",
+                error = %err,
+                "source cache read task failed; falling back to origin"
+            );
+            None
+        }
+    }
+}
+
+async fn store_source_cache(state: &AppState, digest: String, bytes: Bytes) {
+    let Some(source_cache) = state.source_cache.clone() else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || source_cache.put_raw(&digest, &bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            state
+                .metrics
+                .record_cache_error(CacheTier::Source, CacheOp::Write);
+            tracing::warn!(
+                cache = "source",
+                op = "write",
+                error = %err,
+                "source cache write failed; continuing without caching raw source"
+            );
+        }
+        Err(err) => {
+            state
+                .metrics
+                .record_cache_error(CacheTier::Source, CacheOp::Write);
+            tracing::warn!(
+                cache = "source",
+                op = "write",
+                error = %err,
+                "source cache write task failed"
+            );
+        }
+    }
 }
 
 fn is_http_source(source: &str) -> bool {
@@ -1717,5 +1797,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(via_cleanup.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cache_read_and_write_errors_degrade_gracefully_and_increment_metrics() {
+        let fixture = TestFixture::new("cache-errors");
+        let local = LocalFsOrigin::new(&fixture.origin_dir, 1024 * 1024).unwrap();
+        // Tiny max_entry_bytes forces both `get` (when an oversized file sits on disk) and
+        // `put` (when the encoded variant exceeds 16 bytes) to return `CacheError::EntryTooLarge`.
+        let cache = FsCache::new(&fixture.cache_dir, 16).unwrap();
+
+        let spec = TransformSpec {
+            dimensions: crate::domain::TargetDimensions::new(
+                Some(crate::domain::Dimension::new(crate::domain::Axis::Width, 40, 8192).unwrap()),
+                None,
+            ),
+            format: OutputFormat::Jpeg,
+            ..TransformSpec::default()
+        };
+        let key = CacheKey::from_parts(LOCAL_ORIGIN_ID, "sample.png", &spec);
+        let entry_dir = fixture
+            .cache_dir
+            .join(key.shard_dir())
+            .join(key.source_digest_hex());
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join(key.file_name()), vec![0u8; 64]).unwrap();
+
+        let state = Arc::new(AppState::new(local, cache));
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/load?url=sample.png&w=40&f=jpeg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-cache").unwrap(), "MISS");
+
+        let metrics_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+        let body = metrics_resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"read\"} 1\n"));
+        assert!(text.contains("murklet_cache_errors_total{cache=\"variant\",op=\"write\"} 1\n"));
     }
 }
