@@ -75,5 +75,5 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.IMAGE_NAME }}
-          short-description: "Self-contained Rust image proxy with policy-first controls, AVIF/WebP/JPEG/PNG, and bounded resource isolation."
+          short-description: "Self-contained Rust image proxy: AVIF/WebP/JPEG/PNG, per-origin policies, and bounded limits."
           readme-filepath: ./README.md
